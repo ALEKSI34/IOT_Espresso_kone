@@ -7,12 +7,41 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <ArduinoJSON.h>
+#include <EEPROM.h>
+#include <max6675.h>
+#include <PSM.h>
+
+// IO
+#define relayPin 3
+#define brewPin 8
+#define zcPin 2
+#define steamPin 9
+#define PressurePin 10
+#define dimmerPin 11
+
+// SPI pins for MAX6675
+#define thermoDO 19
+#define thermoCS 23
+#define thermoCLK 5
+
+//MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+
+const uint8_t range = 127;
+//PSM pump(zcPin, dimmerPin, range, FALLING);
 
 // Replace with your network credentials
 const char* ssid = "KRP 01";
 const char* password = "Salasana1";
 
+StaticJsonDocument<200> doc;
+StaticJsonDocument<200> GeneralDoc;
+
 hw_timer_t * updateTimer = NULL;
+
+TaskHandle_t WebServerTask, ControllerTask;
+
+volatile uint8_t NO_INPUT, DATA_STORED = 0;
 
 typedef struct { String key; int val; } t_dictionary;
 
@@ -29,7 +58,6 @@ const char *StateStrings[4] = {
   "BREWING",
   "STEAMING"
 };
-
 
 enum Variables {
   ONTIME = 0,
@@ -61,14 +89,17 @@ static t_dictionary lookuptable[] = {
   {"BREWPRESSUREEND", BREWPRESSUREEND}
 };
 
+#define NKEYS 12
+
 enum OutputType {
   eFloat = 0,
   eTime = 1,
   eStateString = 2
 };
 
-typedef struct { float value; Variables eKey; } t_EspressoItem;
+typedef struct { float_t value; Variables eKey; } t_EspressoItem;
 
+SemaphoreHandle_t IOTSemaphore = xSemaphoreCreateMutex();
 t_EspressoItem EspressoIOTArray[] = {
   {0.0, TEMP},
   {0.0, BREWTIME},
@@ -79,12 +110,24 @@ t_EspressoItem EspressoIOTArray[] = {
   {0.0, PREINFBAR},
   {0.0, BREWTIMEREF},
   {0.0, BREWPRESSUREINIT},
-  {0.0, BREWPRESSUREEND},
+  {0.0, BREWPRESSUREEND}
 };
+uint8_t EspIOTArrLen = 10;
+// Pointers for easier access of these variables.
+float_t *CurPressure = &EspressoIOTArray[2].value;
+float_t *CurTemp = &EspressoIOTArray[0].value;
 
-
-
-#define NKEYS 12
+// Stuff stored to EEPROM, initialized to 0.0, updated from old values from eeprom.
+t_EspressoItem BrewParameters[] = {
+  {0.0, BREWTEMPREF},
+  {0.0, STEAMTEMPREF},
+  {0.0, PREINFTIME},
+  {0.0, PREINFBAR},
+  {0.0, BREWTIMEREF},
+  {0.0, BREWPRESSUREINIT},
+  {0.0, BREWPRESSUREEND}
+};
+const uint8_t ParameterCount = 7;
 
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
@@ -144,7 +187,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     opacity: 0.7; /* Set transparency (for mouse-over effects on hover) */
     -webkit-transition: .2s; /* 0.2 seconds transition on hover */
     transition: opacity .2s;
-    cursor-colo
   }
   /* The slider handle (use -webkit- (Chrome, Opera, Safari, Edge) and -moz- (Firefox) to override default look) */
   .slider::-webkit-slider-thumb {
@@ -208,6 +250,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       <p class="value">Pressure: <span id="PRESSURE">%PRESSURE%</span></p>
       <p class="value">State: <span id="STATE">%STATE%</span></p>
     </div>
+    <div id='chart_div', style='height: 400px'></div>
     
     <div class="card">
       <h2>Heating Parameters:</h2>
@@ -245,10 +288,17 @@ const char index_html[] PROGMEM = R"rawliteral(
       </div>
     </div>
   </div>
+<script type='text/javascript' src='https://www.gstatic.com/charts/loader.js'></script>
 <script>
   var gateway = `ws://${window.location.hostname}/ws`;
   var websocket;
   window.addEventListener('load', onLoad);
+
+  google.charts.load('current', {
+    packages: ['corechart','line']
+  });
+  google.charts.setOnLoadCallback(drawChart);
+
   function initWebSocket() {
     console.log('Trying to open a WebSocket connection...');
     websocket = new WebSocket(gateway);
@@ -256,9 +306,12 @@ const char index_html[] PROGMEM = R"rawliteral(
     websocket.onclose   = onClose;
     websocket.onmessage = onMessage;
   }
-  function updateVal(Key,Value) {
-    BaseStr = '';
-    websocket.send(BaseStr.concat(Key,'~',Value));
+  function updateVal(Key_in,Value_in) {
+    var Unit = {
+      Key: Key_in,
+      Value: Value_in
+    };
+    websocket.send(JSON.stringify(Unit));
   }
   function onOpen(event) {
     console.log('Connection opened');
@@ -269,38 +322,106 @@ const char index_html[] PROGMEM = R"rawliteral(
   }
   function onMessage(event) {
     var state;
-    var message = event.data;
-    var fields = message.split('~');
-    var key = fields[0];
-    var value = fields[1];
-    document.getElementById(key).innerHTML = value;
+    var message = JSON.parse(event.data);
+    if (message.hasOwnProperty('Key')){
+      document.getElementById(message.Key).innerHTML = message.Value;
+    } else {
+      updateChart(message);
+    }
   }
   function onLoad(event) {
     initWebSocket();
+  }
+  var data;
+  var options;
+  var chart;
+  function drawChart() {
+    data = google.visualization.arrayToDataTable([
+      ['Second', 'Brew Pressure', 'Boiler Temperature'],
+      [0, 0, 22]
+    ]);
+      // create options object with titles, colors, etc.
+    options = {
+      title: 'Real-Time Monitoring',
+      curveType: 'function',
+      legend: { position: 'none'},
+      intervals: {'style':'line'},
+      animation: {
+        duration: 500
+      },
+      series: {
+        0: {targetAxisIndex: 0},
+        1: {targetAxisIndex: 1}
+      },
+      hAxis: {
+        title: 'Time [s]',
+        minValue: 0,
+        gridlines: {interval : [1, 2, 2.5, 5]},
+        scaleType: 'linear',
+        viewWindow : {max: 30}
+      },
+      vAxes: {
+        0: {title: 'Pressure (bar)',
+            logScale: false,
+            maxValue: 10},
+        1: {title: 'Temperature (Celsius)',
+            logScale: false, 
+            maxValue: 160}
+      }
+    };
+    // draw chart on load
+    chart = new google.visualization.LineChart(
+      document.getElementById('chart_div')
+    );
+    chart.draw(data, options);
+  }
+  function updateChart(message) {
+    let Time = JSON.parse(message.Time);
+    let Pressure = JSON.parse(message.Pressure);
+    let Temperature = JSON.parse(message.Temperature);
+
+    let T_val = parseFloat(Time.Value);
+    let P_val = parseFloat(Pressure.Value);
+    let Temp_val = parseFloat(Temperature.Value);
+
+    data.addRow([T_val, P_val, Temp_val]);
+    if (T_val > 30) {
+        options.hAxis.viewWindow = { min: T_val-30, max: T_val};
+    } 
+    if (data.getNumberOfRows() > (45/0.5)){
+      data.removeRow(0);
+    }
+    chart.draw(data,options);
   }
 </script>
 </body>
 </html>
 )rawliteral";
 
-void notifyClients(String Key, String Value) {
-  Serial.println(Key+String("~")+Value+String('\n'));
-  ws.textAll(Key+"~"+Value);
+String FormJSONMessage (String Key, String Value) {
+  String jsonString = "";
+  JsonObject object = doc.to<JsonObject>();
+  object["Key"] = Key;
+  object["Value"] = Value;
+  serializeJson(doc, jsonString);
+  return jsonString;
 }
 
 void handleWebSocketMessage(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
   AwsFrameInfo *info = (AwsFrameInfo*)arg;
   if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-    //Serial.printf("ws[%s][%u] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT)?"text":"binary", info->len);
-    //Serial.printf("\n");
     data[len] = 0;
     
-    char* Message = strtok((char*)data, "~");
-    if (Message) {
-      char *Key = Message;
-      Message = strtok(NULL, "~");
-      char *Value = Message;
-      notifyClients(String(Key),String(Value));
+    DeserializationError error = deserializeJson(doc, data);
+
+    if (error) {
+      Serial.print(F("deserializeJson() failed: "));
+      Serial.println(error.f_str());
+    } else {
+      UpdateInternalValue(doc["Key"],doc["Value"]);
+      ws.textAll(FormJSONMessage(doc["Key"],doc["Value"]));
+      DATA_STORED = 0; // Flag for plausible data update.
+      NO_INPUT = 0;
     }
   }
 }
@@ -359,31 +480,12 @@ String SecondsToString(int32_t seconds) {
 }
 
 String processor(const String& var){
-  switch (keyfromstring(var)) {
-    case ONTIME:
-      return "15 min 26 s";
-    case TEMP:
-      return "82.4";
-    case BREWTIME:
-      return "0.0";
-    case PRESSURE:
-      return "1.0";
-    case STATE:
-      return "HEATING";
-    case BREWTEMPREF:
-      return "95";
-    case STEAMTEMPREF:
-      return "145";
-    case PREINFTIME:
-      return "8 s";
-    case PREINFBAR:
-      return "2 bar";
-    case BREWTIMEREF:
-      return "30 s";
-    case BREWPRESSUREINIT:
-      return "9 bar";
-    case BREWPRESSUREEND:
-      return "8 bar";
+  uint8_t i;
+  int Key = keyfromstring(var);
+  for (i = 0; i < EspIOTArrLen; i++) {
+    if (EspressoIOTArray[i].eKey == Key) {
+      return String(EspressoIOTArray[i].value);
+    }
   }
   return String();
 }
@@ -394,10 +496,21 @@ void onUpdate(void){
   IfUpdate = 1;
 }
 
-void setup(){
-  // Serial port for debugging purposes
-  Serial.begin(115200);
-  
+String GetGeneralInformationSerialized(float seconds) {
+  String jsonString = "";
+  JsonObject object = GeneralDoc.to<JsonObject>();
+  object["Time"] = FormJSONMessage(StringfromEnum(ONTIME),String(seconds));
+  object["Pressure"] = FormJSONMessage(StringfromEnum(PRESSURE),String(EspressoIOTArray[2].value));
+  object["Temperature"] = FormJSONMessage(StringfromEnum(TEMP),String(EspressoIOTArray[0].value));
+  serializeJson(GeneralDoc, jsonString);
+  return jsonString;
+}
+
+
+States StateMachineState = HEATING;
+static float seconds = 0;
+
+void SetupWebServer(void * parameters) {
   // Connect to Wi-Fi
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -418,21 +531,164 @@ void setup(){
   // Start server
   server.begin();
 
+  static float referenceSec = 0.0;
+
+  for (;;) {
+    ws.cleanupClients();
+    seconds += 0.5; // Visual time hacky hack
+    xSemaphoreTake( IOTSemaphore, portMAX_DELAY);
+    ws.textAll(FormJSONMessage(StringfromEnum(ONTIME),SecondsToString(seconds)));
+    ws.textAll(FormJSONMessage(StringfromEnum(STATE),String(StateStrings[StateMachineState])));
+    ws.textAll(GetGeneralInformationSerialized(seconds));
+    xSemaphoreGive(IOTSemaphore);
+    vTaskDelay( 500 / portTICK_PERIOD_MS );
+    if (NO_INPUT) {
+      if (seconds-referenceSec > 15 ) {
+        if (!DATA_STORED) {
+          UpdateParametersArray();
+          StoreParametersToEEPROM(0);
+        }
+      }
+    } else {
+      referenceSec = seconds;
+      NO_INPUT = 1;
+    }
+  }
+  vTaskDelete(NULL);
+}
+
+void RunMainController(void * parameters)  {
+  for (;;) {
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
+    *CurPressure = float_t(10.0);
+    *CurTemp = float_t(10.0);
+    xSemaphoreGive(IOTSemaphore);
+    vTaskDelay( 50 / portTICK_PERIOD_MS);
+  }
+  vTaskDelete(NULL);
+}
+
+void UpdateInternalValue(String Key, String Value) {
+  uint8_t i;
+  int KeyEnum = keyfromstring(Key);
+  for (i = 0; i < EspIOTArrLen; i++) {
+    if (EspressoIOTArray[i].eKey == KeyEnum) {
+        EspressoIOTArray[i].value = Value.toFloat();
+        Serial.println(Key + " Changed to -> " + Value);
+        break;
+    }
+  }
+}
+
+void UpdateParametersArray() {
+  t_EspressoItem *LiveValue, *ParamValue;
+
+  uint8_t i,j;
+  for (i = 0; i < EspIOTArrLen; i++) {
+    for (j = 0; j < ParameterCount; j++) {
+      LiveValue = &EspressoIOTArray[i];
+      ParamValue = &BrewParameters[j];
+      if (LiveValue->eKey == ParamValue->eKey) {
+        ParamValue->value = LiveValue->value;
+      }
+    }
+  }
+}
+
+void SyncParametersToLive() {
+  t_EspressoItem *LiveValue, *ParamValue;
+
+  uint8_t i,j;
+  for (i = 0; i < EspIOTArrLen; i++) {
+    for (j = 0; j < ParameterCount; j++) {
+      LiveValue = &EspressoIOTArray[i];
+      ParamValue = &BrewParameters[j];
+      if (LiveValue->eKey == ParamValue->eKey) {
+        LiveValue->value = ParamValue->value;
+      }
+    }
+  }
+}
+
+void StoreParametersToEEPROM(uint8_t FirstAddress){
+  uint8_t eeAddress = FirstAddress;
+  uint8_t i = 0;
+  float_t *Value;
+  Serial.printf("Storing Values to EEPROM...\n");
+  for (i = 0; i < ParameterCount;i++) {
+    t_EspressoItem *CurrentParam = &BrewParameters[i];
+    Value = &(CurrentParam->value);
+    if (*Value != EEPROM.readFloat(eeAddress)) {
+      EEPROM.writeFloat(eeAddress, *Value);
+      EEPROM.commit();
+      Serial.println(StringfromEnum(CurrentParam->eKey)+" => "+String(EEPROM.readFloat(eeAddress)) + " Address: "+String(eeAddress));
+    } else {
+      Serial.println(StringfromEnum(CurrentParam->eKey)+ " => X, No change detected. Value: "+String(*Value));
+    }
+    eeAddress += sizeof(float_t);
+  }
+  DATA_STORED = 1;
+  Serial.printf("-----------------------\n");
+}
+
+void GetParametersFromEEPROM(uint8_t FirstAddress){
+  uint8_t eeAddress = FirstAddress; // Start address to proper place.
+  uint8_t i, pByte = 0;
+  float_t Value;
+  Serial.printf("Reading Values from EEPROM...\n");
+  for (i = 0; i < ParameterCount;i++) {
+    t_EspressoItem *CurrentParam = &BrewParameters[i];
+
+    Value = EEPROM.readFloat(eeAddress);
+    CurrentParam->value = Value;
+    Serial.println(StringfromEnum(CurrentParam->eKey)+" == "+String(CurrentParam->value)+ " Address: "+ String(eeAddress));
+    eeAddress += sizeof(float_t);
+  }
+  Serial.printf("-----------------------\n");
+}
+
+void setup(){
+  // Serial port for debugging purposes
+  Serial.begin(115200);
+  EEPROM.begin(30); // We don't need more that 30 bytes
+
+  //pinMode(relayPin, OUTPUT);
+  //pinMode(brewPin, INPUT_PULLUP);
+  //pinMode(steamPin, INPUT_PULLUP);
+
+  uint8_t ParametersEEAddress = 0;
+
+  GetParametersFromEEPROM(ParametersEEAddress); // Load up parameters from EEPROM
+
+  SyncParametersToLive();
+
   updateTimer = timerBegin(1, 80, true);
   timerAttachInterrupt(updateTimer, &onUpdate, true);
   timerAlarmWrite(updateTimer, 1000000, true);
   timerAlarmEnable(updateTimer);
+  
+  xTaskCreatePinnedToCore(
+    SetupWebServer,
+    "WebServerTask",
+    10000,
+    NULL,
+    2,
+    &WebServerTask,
+    CONFIG_ARDUINO_RUNNING_CORE
+  );
+
+  
+  xTaskCreatePinnedToCore(
+    RunMainController,
+    "ControllerTask",
+    10000,
+    NULL,
+    1,
+    &ControllerTask,
+    !CONFIG_ARDUINO_RUNNING_CORE
+  ); 
 }
 
-States StateMachineState = HEATING;
-static int32_t seconds = 0;
 void loop() {
-  uint8_t i;
-  ws.cleanupClients();
-  if (IfUpdate) {
-    seconds += 1;
-    ws.textAll(StringfromEnum(ONTIME)+'~'+SecondsToString(seconds));
-    ws.textAll(StringfromEnum(STATE)+'~'+String(StateStrings[StateMachineState]));
-    IfUpdate = 0;  
-  }
+
 }
