@@ -11,14 +11,16 @@
 #include <EEPROM.h>
 #include <max6675.h>
 #include <PSM.h>
+#include "PI.h"
+#include "PWM_Relay.h"
 
 // IO
 #define relayPin 3
 #define brewPin 8
-#define zcPin 2
+#define sensePin 2
 #define steamPin 9
 #define PressurePin 10
-#define dimmerPin 11
+#define dimmerControlPin 11
 
 // SPI pins for MAX6675
 #define thermoDO 19
@@ -28,7 +30,7 @@
 //MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
 const uint8_t range = 127;
-//PSM pump(zcPin, dimmerPin, range, FALLING);
+PSM pump(sensePin, dimmerControlPin, range, FALLING);
 
 // Replace with your network credentials
 const char* ssid = "KRP 01";
@@ -39,9 +41,16 @@ StaticJsonDocument<200> GeneralDoc;
 
 hw_timer_t * updateTimer = NULL;
 
-TaskHandle_t WebServerTask, ControllerTask;
+TaskHandle_t WebServerTask, StateMachineTask, ControllerTask, KTypeUpdateTask, PressureUpdateTask, BoilerPITask, PressurePITask;
 
 volatile uint8_t NO_INPUT, DATA_STORED = 0;
+
+float_t PIDtRef, PIDPRef;
+float_t *BoilerReference, *PressureReference;
+
+uint8_t BrewCounter = 0; // When 1, count the brew counter.
+float_t CurrentTime = 0;
+float_t BrewTimeT0 = 0;
 
 typedef struct { String key; int val; } t_dictionary;
 
@@ -49,8 +58,11 @@ enum States {
   HEATING = 0,
   PREINFUSING = 1,
   BREWING = 2,
-  STEAMING = 3
+  STEAMING = 3,
+  OVERHEATED = 4
 };
+
+States StateMachineState = HEATING;
 
 const char *StateStrings[4] = {
   "HEATING",
@@ -60,18 +72,18 @@ const char *StateStrings[4] = {
 };
 
 enum Variables {
-  ONTIME = 0,
-  TEMP = 1,
-  BREWTIME = 2,
-  PRESSURE = 3,
-  STATE = 4,
-  BREWTEMPREF = 5,
-  STEAMTEMPREF = 6,
-  PREINFTIME = 7,
-  PREINFBAR = 8,
-  BREWTIMEREF = 9,
-  BREWPRESSUREINIT = 10,
-  BREWPRESSUREEND = 11
+  TEMP = 0,
+  BREWTIME = 1,
+  PRESSURE = 2,
+  BREWTEMPREF = 3,
+  STEAMTEMPREF = 4,
+  PREINFTIME = 5,
+  PREINFBAR = 6,
+  BREWTIMEREF = 7,
+  BREWPRESSUREINIT = 8,
+  BREWPRESSUREEND = 9,
+  ONTIME = 10,
+  STATE = 11
 };
 
 static t_dictionary lookuptable[] = {
@@ -91,15 +103,10 @@ static t_dictionary lookuptable[] = {
 
 #define NKEYS 12
 
-enum OutputType {
-  eFloat = 0,
-  eTime = 1,
-  eStateString = 2
-};
-
 typedef struct { float_t value; Variables eKey; } t_EspressoItem;
 
 SemaphoreHandle_t IOTSemaphore = xSemaphoreCreateMutex();
+
 t_EspressoItem EspressoIOTArray[] = {
   {0.0, TEMP},
   {0.0, BREWTIME},
@@ -133,6 +140,9 @@ const uint8_t ParameterCount = 7;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
+// Whole webpage here btw.
+// Uses google charts for plotting, so internet connection required for your device.
+// Should still work without one idk, haven't tested
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
 <head>
@@ -358,7 +368,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         minValue: 0,
         gridlines: {interval : [1, 2, 2.5, 5]},
         scaleType: 'linear',
-        viewWindow : {max: 30}
+        viewWindow : {max: 60}
       },
       vAxes: {
         0: {title: 'Pressure (bar)',
@@ -375,6 +385,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     );
     chart.draw(data, options);
   }
+  var PrevKey = "";
   function updateChart(message) {
     let Time = JSON.parse(message.Time);
     let Pressure = JSON.parse(message.Pressure);
@@ -384,11 +395,17 @@ const char index_html[] PROGMEM = R"rawliteral(
     let P_val = parseFloat(Pressure.Value);
     let Temp_val = parseFloat(Temperature.Value);
 
+    if (PrevKey != Time.Key) {
+      data.removeRows(0,data.getNumberOfRows());
+    }
+
+    PrevKey = Time.Key;
+
     data.addRow([T_val, P_val, Temp_val]);
-    if (T_val > 30) {
-        options.hAxis.viewWindow = { min: T_val-30, max: T_val};
+    if (T_val > 60) {
+        options.hAxis.viewWindow = { min: T_val-60, max: T_val};
     } 
-    if (data.getNumberOfRows() > (45/0.5)){
+    if (data.getNumberOfRows() > (75/0.5)){
       data.removeRow(0);
     }
     chart.draw(data,options);
@@ -397,6 +414,93 @@ const char index_html[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
+
+
+int keyfromstring(const String& var){
+  int i = 0;
+  t_dictionary *item;
+  for ( i = 0; i < NKEYS; i++) {
+    t_dictionary *item = &lookuptable[i];
+    if (item->key == var){
+      return item->val;
+    }
+  }
+  return -1;
+}
+
+void UpdateInternalValue(String Key, String Value) {
+  uint8_t i;
+  int KeyEnum = keyfromstring(Key);
+  for (i = 0; i < EspIOTArrLen; i++) {
+    if (EspressoIOTArray[i].eKey == KeyEnum) {
+        EspressoIOTArray[i].value = Value.toFloat();
+        Serial.println(Key + " Changed to -> " + Value);
+        break;
+    }
+  }
+}
+
+void UpdateParametersArray() {
+  t_EspressoItem *LiveValue, *ParamValue;
+
+  uint8_t i,j;
+  for (i = 0; i < EspIOTArrLen; i++) {
+    for (j = 0; j < ParameterCount; j++) {
+      LiveValue = &EspressoIOTArray[i];
+      ParamValue = &BrewParameters[j];
+      if (LiveValue->eKey == ParamValue->eKey) {
+        ParamValue->value = LiveValue->value;
+      }
+    }
+  }
+}
+
+void SyncParametersToLive() {
+  t_EspressoItem *LiveValue, *ParamValue;
+
+  uint8_t i,j;
+  for (i = 0; i < EspIOTArrLen; i++) {
+    for (j = 0; j < ParameterCount; j++) {
+      LiveValue = &EspressoIOTArray[i];
+      ParamValue = &BrewParameters[j];
+      if (LiveValue->eKey == ParamValue->eKey) {
+        LiveValue->value = ParamValue->value;
+      }
+    }
+  }
+}
+
+String StringfromEnum(Variables var) {
+  int i = 0;
+  t_dictionary *item;
+  for ( i = 0; i < NKEYS; i++) {
+    t_dictionary *item = &lookuptable[i];
+    if (item->val == var){
+      return item->key;
+    }
+  }
+  return String();
+}
+
+String SecondsToString(int32_t seconds) {
+  String Minutes = String(int32_t(seconds / 60));
+  String Seconds = String(int32_t(seconds % 60));
+  return Minutes + " min "+ Seconds + " s";
+}
+
+float_t InterpolateValueOnCurve(float_t xn,float_t y0, float_t y1, float_t x1) {
+  // Simple linear interpolation implementation
+  if (xn > x1) {
+    return y1;
+  } 
+  else {
+    return y0+(xn)*((y1-y0)/(x1));
+  }
+}
+
+/////////////////////////
+//// WEBSERVER STUFF ////
+/////////////////////////
 
 String FormJSONMessage (String Key, String Value) {
   String jsonString = "";
@@ -449,36 +553,6 @@ void initWebSocket() {
   server.addHandler(&ws);
 }
 
-int keyfromstring(const String& var){
-  int i = 0;
-  t_dictionary *item;
-  for ( i = 0; i < NKEYS; i++) {
-    t_dictionary *item = &lookuptable[i];
-    if (item->key == var){
-      return item->val;
-    }
-  }
-  return -1;
-}
-
-String StringfromEnum(Variables var) {
-  int i = 0;
-  t_dictionary *item;
-  for ( i = 0; i < NKEYS; i++) {
-    t_dictionary *item = &lookuptable[i];
-    if (item->val == var){
-      return item->key;
-    }
-  }
-  return String();
-}
-
-String SecondsToString(int32_t seconds) {
-  String Minutes = String(int32_t(seconds / 60));
-  String Seconds = String(int32_t(seconds % 60));
-  return Minutes + " min "+ Seconds + " s";
-}
-
 String processor(const String& var){
   uint8_t i;
   int Key = keyfromstring(var);
@@ -496,19 +570,19 @@ void onUpdate(void){
   IfUpdate = 1;
 }
 
-String GetGeneralInformationSerialized(float seconds) {
+String GetGeneralInformationSerialized(uint8_t bBrewing) {
   String jsonString = "";
   JsonObject object = GeneralDoc.to<JsonObject>();
-  object["Time"] = FormJSONMessage(StringfromEnum(ONTIME),String(seconds));
+  if (bBrewing) { 
+    object["Time"] = FormJSONMessage(StringfromEnum(BREWTIME),String(EspressoIOTArray[BREWTIME].value));
+  } else {
+    object["Time"] = FormJSONMessage(StringfromEnum(ONTIME),String(CurrentTime));
+  }
   object["Pressure"] = FormJSONMessage(StringfromEnum(PRESSURE),String(EspressoIOTArray[2].value));
   object["Temperature"] = FormJSONMessage(StringfromEnum(TEMP),String(EspressoIOTArray[0].value));
   serializeJson(GeneralDoc, jsonString);
   return jsonString;
 }
-
-
-States StateMachineState = HEATING;
-static float seconds = 0;
 
 void SetupWebServer(void * parameters) {
   // Connect to Wi-Fi
@@ -531,84 +605,229 @@ void SetupWebServer(void * parameters) {
   // Start server
   server.begin();
 
-  static float referenceSec = 0.0;
+  static float_t referenceSec = 0.0;
 
   for (;;) {
     ws.cleanupClients();
-    seconds += 0.5; // Visual time hacky hack
-    xSemaphoreTake( IOTSemaphore, portMAX_DELAY);
-    ws.textAll(FormJSONMessage(StringfromEnum(ONTIME),SecondsToString(seconds)));
+    CurrentTime += 0.5; // Visual time hacky hack
+    ws.textAll(FormJSONMessage(StringfromEnum(ONTIME),SecondsToString(CurrentTime)));
     ws.textAll(FormJSONMessage(StringfromEnum(STATE),String(StateStrings[StateMachineState])));
-    ws.textAll(GetGeneralInformationSerialized(seconds));
-    xSemaphoreGive(IOTSemaphore);
+
+    xSemaphoreTake( IOTSemaphore, portMAX_DELAY);
+    if (BrewCounter) {
+      EspressoIOTArray[BREWTIME].value = CurrentTime-BrewTimeT0;
+    } else {
+      BrewTimeT0 = CurrentTime;
+      EspressoIOTArray[BREWTIME].value = 0.0;
+    }
+    xSemaphoreGive( IOTSemaphore);
+
+    ws.textAll(FormJSONMessage(StringfromEnum(BREWTIME),SecondsToString(EspressoIOTArray[BREWTIME].value)));
+    ws.textAll(GetGeneralInformationSerialized(BrewCounter));
+
+
     vTaskDelay( 500 / portTICK_PERIOD_MS );
     if (NO_INPUT) {
-      if (seconds-referenceSec > 15 ) {
+      if (CurrentTime-referenceSec > 15 ) {
         if (!DATA_STORED) {
           UpdateParametersArray();
           StoreParametersToEEPROM(0);
         }
       }
     } else {
-      referenceSec = seconds;
+      referenceSec = CurrentTime;
       NO_INPUT = 1;
     }
   }
   vTaskDelete(NULL);
 }
 
-void RunMainController(void * parameters)  {
+//////////////////
+//// STATES  /////
+//////////////////
+
+void HeatingState() {
+  // HEATING STATE //
+  digitalWrite(relayPin, LOW);
+  *BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
+  *PressureReference = 0.0;
+}
+
+void SteamingState() {
+  // STEAMING STATE //
+  *BoilerReference = EspressoIOTArray[STEAMTEMPREF].value;
+  *PressureReference = 0.0;
+}
+
+void PreInfusingState() {
+  // PREINFUSING STATE //
+
+  BrewCounter = 1;
+
+  *PressureReference = EspressoIOTArray[PREINFBAR].value;
+  *BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
+}
+
+void BrewingState() {
+  // BREWING STATE //
+  BrewCounter = 1;
+
+  *BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
+
+  // Update Pressure reference accordingly.
+  *PressureReference = InterpolateValueOnCurve(
+    CurrentTime, 
+    EspressoIOTArray[BREWPRESSUREINIT].value,
+    EspressoIOTArray[BREWPRESSUREEND].value,
+    EspressoIOTArray[BREWTIMEREF].value  
+  );
+}
+
+void OverheatingState() {
+  // STEAMING STATE //
+  digitalWrite(relayPin, LOW);
+  *BoilerReference = 0.0;
+  *PressureReference = 0.0;
+}
+
+void RunMainStateMachine(void * parameters)  {
   for (;;) {
+
+    uint8_t BrewSwitch = (CurrentTime > 60);
+    uint8_t SteamSwitch = 0;
+    uint8_t PreInfusingEnabled = (EspressoIOTArray[PREINFTIME].value != 0);
+
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
-    *CurPressure = float_t(10.0);
-    *CurTemp = float_t(10.0);
+    // Main state machine
+
+    // Check for overheating
+    if (*CurTemp > float_t(160.0)) {
+      StateMachineState = OVERHEATED;
+    }
+
+    switch (StateMachineState)
+    {
+    case HEATING:
+      if (BrewSwitch) {
+        StateMachineState = PREINFUSING;
+      } 
+      else if (SteamSwitch){
+        StateMachineState = STEAMING;
+      } 
+      else {
+        HeatingState();
+      }
+      break;
+    case STEAMING:
+      SteamingState();
+      break;
+    case PREINFUSING:
+      if (PreInfusingEnabled) {
+        PreInfusingState();
+      } else {
+        StateMachineState = BREWING;
+      }
+      break;
+    case BREWING:
+      if (BrewSwitch) {
+        BrewingState();
+      } else {
+        StateMachineState = HEATING;
+      }
+      break;
+    case OVERHEATED:
+      if (*CurTemp > float_t(160.0)) {
+        OverheatingState();
+      }
+      else {
+        StateMachineState = HEATING;
+      }
+    }
+
+    EspressoIOTArray[STATE].value = StateMachineState;
+
     xSemaphoreGive(IOTSemaphore);
     vTaskDelay( 50 / portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
 }
 
-void UpdateInternalValue(String Key, String Value) {
-  uint8_t i;
-  int KeyEnum = keyfromstring(Key);
-  for (i = 0; i < EspIOTArrLen; i++) {
-    if (EspressoIOTArray[i].eKey == KeyEnum) {
-        EspressoIOTArray[i].value = Value.toFloat();
-        Serial.println(Key + " Changed to -> " + Value);
-        break;
-    }
-  }
+/////////////////////////////
+//// SENSOR UPDATE STUFF ////
+/////////////////////////////
+
+float_t kThermoread(){
+  return float_t(85.0); //thermocouple.readCelsius();
 }
 
-void UpdateParametersArray() {
-  t_EspressoItem *LiveValue, *ParamValue;
-
-  uint8_t i,j;
-  for (i = 0; i < EspIOTArrLen; i++) {
-    for (j = 0; j < ParameterCount; j++) {
-      LiveValue = &EspressoIOTArray[i];
-      ParamValue = &BrewParameters[j];
-      if (LiveValue->eKey == ParamValue->eKey) {
-        ParamValue->value = LiveValue->value;
-      }
-    }
+void UpdateKTypeTemp(void * parameters) {
+  // Temperature value arrives via SPI from MAX6675
+  for (;;) {
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
+    *CurTemp = kThermoread();
+    xSemaphoreGive(IOTSemaphore);
+    vTaskDelay(250 / portTICK_PERIOD_MS);
   }
+  vTaskDelete(NULL);
 }
 
-void SyncParametersToLive() {
-  t_EspressoItem *LiveValue, *ParamValue;
-
-  uint8_t i,j;
-  for (i = 0; i < EspIOTArrLen; i++) {
-    for (j = 0; j < ParameterCount; j++) {
-      LiveValue = &EspressoIOTArray[i];
-      ParamValue = &BrewParameters[j];
-      if (LiveValue->eKey == ParamValue->eKey) {
-        LiveValue->value = ParamValue->value;
-      }
-    }
+void UpdatePressure(void * parameters) {
+  // Pressure Sensor reports output, in range 0.5V for 0bar, 4.5V for 12bar. 
+  // ESP32 can only accept signal upto 3.3V. Voltage conversion is applied with simple non inverting op-amp circuit and a voltage divider.
+  // This will mean that, the ranges of these input signals stay the same.
+  // So the total RANGE of these voltages is 4.0V, with offset of 0.5V.
+  float_t Offset = 0.5; // Volts
+  float_t MaxBar = 12; // Bar
+  float_t Range = 4; // Volts
+  for(;;) {
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
+    float_t Voltage = float_t(3.76); //(analogRead(PressurePin)*5.0)/1024.0;
+    *CurPressure = MaxBar*((Voltage-Offset)/Range);
+    xSemaphoreGive(IOTSemaphore);
+    vTaskDelay(5 / portTICK_PERIOD_MS);
   }
+  vTaskDelete(NULL);
 }
+
+
+/////////////////////////
+//// PID CONTROLLERS ////
+/////////////////////////
+
+void BoilerPIController(void * parameters) {
+  // PI Controller, adjusting the boiler temperature
+  // Since the frequency of PWM frequency for relay must be relatively slow (1-10Hz), we can just generate it ourselves.
+
+  PI_Controller PIC = PI_Controller(4, 0.4, 0, 100, 100);
+  PWM_Relay PWM = PWM_Relay(relayPin, 4); // Set Relay PWM frequency to 25Hz
+
+  for (;;) {
+    PIC.Reference = PIDtRef;
+    PIC.Calculate(*CurPressure);
+    PWM.DutyCycle = PIC.Output;
+    PWM.Execute();
+  }
+  vTaskDelete(NULL);
+}
+
+void PressurePIController(void * parameters) {
+  // PI Controller for pressure.
+
+  PI_Controller PIC = PI_Controller(4, 0.4, 0, 12, 10);
+
+  for (;;) {
+    PIC.Reference = PIDPRef;
+    PIC.Calculate(*CurPressure);
+    pump.set(PIC.Output);
+    vTaskDelay( 1000 / portTICK_PERIOD_MS);
+  }
+  vTaskDelete(NULL);
+}
+
+
+//////////////////////
+//// EEPROM STUFF ////
+//////////////////////
 
 void StoreParametersToEEPROM(uint8_t FirstAddress){
   uint8_t eeAddress = FirstAddress;
@@ -652,6 +871,9 @@ void setup(){
   Serial.begin(115200);
   EEPROM.begin(30); // We don't need more that 30 bytes
 
+  BoilerReference = &PIDtRef;
+  PressureReference = &PIDPRef;
+
   //pinMode(relayPin, OUTPUT);
   //pinMode(brewPin, INPUT_PULLUP);
   //pinMode(steamPin, INPUT_PULLUP);
@@ -679,14 +901,52 @@ void setup(){
 
   
   xTaskCreatePinnedToCore(
-    RunMainController,
-    "ControllerTask",
+    RunMainStateMachine,
+    "StateMachineTask",
     10000,
     NULL,
-    1,
+    1, // Priority
     &ControllerTask,
-    !CONFIG_ARDUINO_RUNNING_CORE
+    !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
   ); 
+
+  xTaskCreatePinnedToCore(
+    UpdateKTypeTemp,
+    "KTypeUpdateTask",
+    10000,
+    NULL,
+    3, // Priority
+    &KTypeUpdateTask,
+    !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
+  ); 
+
+  xTaskCreatePinnedToCore(
+    UpdatePressure,
+    "PressureUpdateTask",
+    10000,
+    NULL,
+    3, // Priority
+    &PressureUpdateTask,
+    !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
+  );
+  xTaskCreatePinnedToCore(
+    BoilerPIController,
+    "Boiler PI Controller Task",
+    10000,
+    NULL,
+    2, // Priority
+    &BoilerPITask,
+    !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
+  );
+  xTaskCreatePinnedToCore(
+    PressurePIController,
+    "Pressure PI Controller Task",
+    10000,
+    NULL,
+    2, // Priority
+    &PressurePITask,
+    !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
+  );
 }
 
 void loop() {
