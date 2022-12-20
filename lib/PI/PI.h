@@ -13,7 +13,7 @@ public:
 
     float Calculate(float feedback);
 
-    PI_Controller(float Kp, float Ki, float outMin, float outMax, float antiwindup);
+    PI_Controller(float Kp, float Ki, float OutputRange[2], float antiwindup);
     ~PI_Controller();
 };
 

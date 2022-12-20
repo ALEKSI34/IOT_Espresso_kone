@@ -11,13 +11,15 @@ private:
     float _Ki;
     float _integral;
     float _error;
-    float _min;
-    float _max;
+    float _inmin;
+    float _inmax;
+    float _outmin;
+    float _outmax;
     float _antiwindup;
     bool _enabled;
 public:
 
-    PI_Controller(float Kp, float Ki, float outMin, float outMax, float antiwindup);
+    PI_Controller(float Kp, float Ki, float OutputRange[2], float antiwindup);
     ~PI_Controller();
 
     void EnableOutput();
@@ -28,12 +30,12 @@ public:
 };
 
 PI_Controller::PI_Controller (
-float Kp, float Ki, float outMin, float outMax, float antiwindup
+float Kp, float Ki, float OutputRange[2], float antiwindup
 ) :
     _Kp(Kp),
     _Ki(Ki),
-    _min(outMin),
-    _max(outMax),
+    _outmin(OutputRange[0]),
+    _outmax(OutputRange[1]),
     _antiwindup(antiwindup),
     _enabled(true),
     _integral(0),
@@ -57,16 +59,19 @@ float PI_Controller::Calculate(float input)
         _integral = -_antiwindup;
     }
 
-    // The actual output
     float _output = P + _Ki*_integral;
-    if (_output > _max) {
-        Output = _max;
-    } else if (_output < _min)
-    {
-        Output = _min;
-    } else {
-        Output = _output;
+
+
+    if (_output > _outmax) {
+        _output = _outmax;
+    } 
+    else if (_output < _outmin) {
+        _output = _outmin;
     }
+
+
+    // Convert value from input range to output range. ie. Celsius to Duty Cycle, or Bar to Pump Range.    
+    Output = _output;
 
     _error = error;
     

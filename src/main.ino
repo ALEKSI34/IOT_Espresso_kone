@@ -15,19 +15,19 @@
 #include "PWM_Relay.h"
 
 // IO
-#define relayPin 3
-#define brewPin 8
-#define sensePin 2
-#define steamPin 9
-#define PressurePin 10
-#define dimmerControlPin 11
+#define relayPin 25 // Pin checked, Connect a port here. Port Component.
+#define brewPin 12 // Pin checked, Connect brew button here. Port Component.
+#define sensePin 27 // Pin checked, Connect sense from dimmer here. Port Component.
+#define steamPin 13 // Pin checked, Connect steam button here. Port component.
+#define PressurePin 34 // Pin checked, Connect pressure sensor here. Port Component.
+#define dimmerControlPin 26 // Pin Checked. Port Component.
 
 // SPI pins for MAX6675
-#define thermoDO 19
-#define thermoCS 23
-#define thermoCLK 5
+#define thermoMISO 19 // Pin Checked, MISO, V_SPI_Q, Connect SO
+#define thermoCS 23 // Pin Checked, MOSI/ V_SPI_D, Connect SS/CS
+#define thermoCLK 5 // Pin checked, V_SPI_CS0, Connect SCK
 
-//MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoMISO);
 
 const uint8_t range = 127;
 PSM pump(sensePin, dimmerControlPin, range, FALLING);
@@ -779,10 +779,13 @@ void UpdatePressure(void * parameters) {
   float_t Offset = 0.5; // Volts
   float_t MaxBar = 12; // Bar
   float_t Range = 4; // Volts
+  float_t Prev_Voltage = (analogRead(PressurePin)*5.0)/1024.0;
   for(;;) {
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
-    float_t Voltage = float_t(3.76); //(analogRead(PressurePin)*5.0)/1024.0;
-    *CurPressure = MaxBar*((Voltage-Offset)/Range);
+    float_t Voltage = (analogRead(PressurePin)*5.0)/1024.0;
+    // Update the current pressure. Use average of 2 previous measurements as the voltage value, for some filtering.
+    *CurPressure = MaxBar*((((Voltage+Prev_Voltage)/2)-Offset)/Range);
+    Prev_Voltage = Voltage;
     xSemaphoreGive(IOTSemaphore);
     vTaskDelay(5 / portTICK_PERIOD_MS);
   }
@@ -798,8 +801,11 @@ void BoilerPIController(void * parameters) {
   // PI Controller, adjusting the boiler temperature
   // Since the frequency of PWM frequency for relay must be relatively slow (1-10Hz), we can just generate it ourselves.
 
-  PI_Controller PIC = PI_Controller(4, 0.4, 0, 100, 100);
-  PWM_Relay PWM = PWM_Relay(relayPin, 4); // Set Relay PWM frequency to 25Hz
+  // Define Ranges for unit conversion
+  float OutputRange[] = {0.0, 100.0};
+
+  PI_Controller PIC = PI_Controller(4, 0.4, OutputRange, 100);
+  PWM_Relay PWM = PWM_Relay(relayPin, 4); // Set Relay PWM frequency to 4Hz - Higher frequencies lead to higher switching losses.
 
   for (;;) {
     PIC.Reference = PIDtRef;
@@ -813,13 +819,16 @@ void BoilerPIController(void * parameters) {
 void PressurePIController(void * parameters) {
   // PI Controller for pressure.
 
-  PI_Controller PIC = PI_Controller(4, 0.4, 0, 12, 10);
+  // Define Ranges for unit conversion
+  float OutputRange[] = {0, float(range)};
+
+  PI_Controller PIC = PI_Controller(4, 0.4, OutputRange, 10);
 
   for (;;) {
     PIC.Reference = PIDPRef;
     PIC.Calculate(*CurPressure);
-    pump.set(PIC.Output);
-    vTaskDelay( 1000 / portTICK_PERIOD_MS);
+    pump.set(int(PIC.Output));
+    vTaskDelay( 25 / portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
 }
@@ -877,6 +886,8 @@ void setup(){
   //pinMode(relayPin, OUTPUT);
   //pinMode(brewPin, INPUT_PULLUP);
   //pinMode(steamPin, INPUT_PULLUP);
+
+  pinMode(PressurePin, INPUT_PULLDOWN);
 
   uint8_t ParametersEEAddress = 0;
 
