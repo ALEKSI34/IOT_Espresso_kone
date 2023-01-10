@@ -9,6 +9,10 @@ class PWM_Relay
 {
 private:
     /* data */
+    unsigned int _basefrequency;
+    unsigned int _stepsize;
+    unsigned int _RelayPin;
+    bool _enabled;
 public:
     float DutyCycle;
 
@@ -16,11 +20,8 @@ public:
     void DisableOutput();
     void Execute();
 
-    float DutyCycle;
-
-    PWM_Relay(unsigned int RelayPin, unsigned int frequency);
+    PWM_Relay( unsigned int RelayPin, unsigned int frequency, unsigned int _stepsize);
     ~PWM_Relay();
 };
-
 
 #endif

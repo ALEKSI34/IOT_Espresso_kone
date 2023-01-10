@@ -10,7 +10,7 @@
 #include <ArduinoJSON.h>
 #include <EEPROM.h>
 #include <max6675.h>
-#include <PSM.h>
+#include "RTOS_PSM.h"
 #include "PI.h"
 #include "PWM_Relay.h"
 
@@ -27,10 +27,12 @@
 #define thermoCS 23 // Pin Checked, MOSI/ V_SPI_D, Connect SS/CS
 #define thermoCLK 5 // Pin checked, V_SPI_CS0, Connect SCK
 
+SemaphoreHandle_t IOTSemaphore = xSemaphoreCreateMutex();
+
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoMISO);
 
-const uint8_t range = 127;
-PSM pump(sensePin, dimmerControlPin, range, FALLING);
+const uint8_t range = 100;
+RTOS_PSM pump(sensePin, dimmerControlPin, range, RISING, 2, 4);
 
 // Replace with your network credentials
 const char* ssid = "KRP 01";
@@ -49,8 +51,9 @@ float_t PIDtRef, PIDPRef;
 float_t *BoilerReference, *PressureReference;
 
 uint8_t BrewCounter = 0; // When 1, count the brew counter.
-float_t CurrentTime = 0;
-float_t BrewTimeT0 = 0;
+float_t currentTime = 0; // Current running time of the ESP32. In float, as seconds, accuracy 0.5s
+float_t brewTime = 0; // Current time of brewing
+float_t brewTimeT0 = 0; // Brewing start time
 
 typedef struct { String key; int val; } t_dictionary;
 
@@ -105,8 +108,6 @@ static t_dictionary lookuptable[] = {
 
 typedef struct { float_t value; Variables eKey; } t_EspressoItem;
 
-SemaphoreHandle_t IOTSemaphore = xSemaphoreCreateMutex();
-
 t_EspressoItem EspressoIOTArray[] = {
   {0.0, TEMP},
   {0.0, BREWTIME},
@@ -121,8 +122,8 @@ t_EspressoItem EspressoIOTArray[] = {
 };
 uint8_t EspIOTArrLen = 10;
 // Pointers for easier access of these variables.
-float_t *CurPressure = &EspressoIOTArray[2].value;
-float_t *CurTemp = &EspressoIOTArray[0].value;
+float_t *CurPressure = &EspressoIOTArray[2].value; // Pointer to Current Pressure value
+float_t *CurTemp = &EspressoIOTArray[0].value; // Pointer to Current Temperature value
 
 // Stuff stored to EEPROM, initialized to 0.0, updated from old values from eeprom.
 t_EspressoItem BrewParameters[] = {
@@ -576,7 +577,7 @@ String GetGeneralInformationSerialized(uint8_t bBrewing) {
   if (bBrewing) { 
     object["Time"] = FormJSONMessage(StringfromEnum(BREWTIME),String(EspressoIOTArray[BREWTIME].value));
   } else {
-    object["Time"] = FormJSONMessage(StringfromEnum(ONTIME),String(CurrentTime));
+    object["Time"] = FormJSONMessage(StringfromEnum(ONTIME),String(currentTime));
   }
   object["Pressure"] = FormJSONMessage(StringfromEnum(PRESSURE),String(EspressoIOTArray[2].value));
   object["Temperature"] = FormJSONMessage(StringfromEnum(TEMP),String(EspressoIOTArray[0].value));
@@ -609,15 +610,15 @@ void SetupWebServer(void * parameters) {
 
   for (;;) {
     ws.cleanupClients();
-    CurrentTime += 0.5; // Visual time hacky hack
-    ws.textAll(FormJSONMessage(StringfromEnum(ONTIME),SecondsToString(CurrentTime)));
+    currentTime += 0.5; // Visual time hacky hack
+    ws.textAll(FormJSONMessage(StringfromEnum(ONTIME),SecondsToString(currentTime)));
     ws.textAll(FormJSONMessage(StringfromEnum(STATE),String(StateStrings[StateMachineState])));
 
     xSemaphoreTake( IOTSemaphore, portMAX_DELAY);
     if (BrewCounter) {
-      EspressoIOTArray[BREWTIME].value = CurrentTime-BrewTimeT0;
+      EspressoIOTArray[BREWTIME].value = currentTime-brewTimeT0;
     } else {
-      BrewTimeT0 = CurrentTime;
+      brewTimeT0 = currentTime;
       EspressoIOTArray[BREWTIME].value = 0.0;
     }
     xSemaphoreGive( IOTSemaphore);
@@ -628,14 +629,14 @@ void SetupWebServer(void * parameters) {
 
     vTaskDelay( 500 / portTICK_PERIOD_MS );
     if (NO_INPUT) {
-      if (CurrentTime-referenceSec > 15 ) {
+      if (currentTime-referenceSec > 15 ) {
         if (!DATA_STORED) {
           UpdateParametersArray();
           StoreParametersToEEPROM(0);
         }
       }
     } else {
-      referenceSec = CurrentTime;
+      referenceSec = currentTime;
       NO_INPUT = 1;
     }
   }
@@ -676,7 +677,7 @@ void BrewingState() {
 
   // Update Pressure reference accordingly.
   *PressureReference = InterpolateValueOnCurve(
-    CurrentTime, 
+    brewTime, 
     EspressoIOTArray[BREWPRESSUREINIT].value,
     EspressoIOTArray[BREWPRESSUREEND].value,
     EspressoIOTArray[BREWTIMEREF].value  
@@ -693,9 +694,9 @@ void OverheatingState() {
 void RunMainStateMachine(void * parameters)  {
   for (;;) {
 
-    uint8_t BrewSwitch = (CurrentTime > 60);
-    uint8_t SteamSwitch = 0;
-    uint8_t PreInfusingEnabled = (EspressoIOTArray[PREINFTIME].value != 0);
+    uint8_t BrewSwitch = digitalRead(brewPin);
+    uint8_t SteamSwitch = digitalRead(steamPin);
+    uint8_t PreInfusingEnabled = (EspressoIOTArray[PREINFTIME].value > 0.5);
 
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
     // Main state machine
@@ -710,6 +711,8 @@ void RunMainStateMachine(void * parameters)  {
     case HEATING:
       if (BrewSwitch) {
         StateMachineState = PREINFUSING;
+        brewTimeT0 = currentTime;
+        brewTime = 0.0;
       } 
       else if (SteamSwitch){
         StateMachineState = STEAMING;
@@ -722,6 +725,7 @@ void RunMainStateMachine(void * parameters)  {
       SteamingState();
       break;
     case PREINFUSING:
+      brewTime += 0.05;
       if (PreInfusingEnabled) {
         PreInfusingState();
       } else {
@@ -729,6 +733,7 @@ void RunMainStateMachine(void * parameters)  {
       }
       break;
     case BREWING:
+      brewTime += 0.05;
       if (BrewSwitch) {
         BrewingState();
       } else {
@@ -801,17 +806,21 @@ void BoilerPIController(void * parameters) {
   // PI Controller, adjusting the boiler temperature
   // Since the frequency of PWM frequency for relay must be relatively slow (1-10Hz), we can just generate it ourselves.
 
-  // Define Ranges for unit conversion
-  float OutputRange[] = {0.0, 100.0};
+  unsigned int piControllerStepSize = 500;
 
-  PI_Controller PIC = PI_Controller(4, 0.4, OutputRange, 100);
-  PWM_Relay PWM = PWM_Relay(relayPin, 4); // Set Relay PWM frequency to 4Hz - Higher frequencies lead to higher switching losses.
+  // Define Ranges for unit conversion
+  float OutputRange[] = {0.0, 1.0};
+  PI_Controller PIC = PI_Controller(5, 20, OutputRange, 100, piControllerStepSize);
+  PWM_Relay PWM = PWM_Relay(relayPin, 4, piControllerStepSize); // Set Relay PWM frequency to 4Hz - Higher frequencies lead to higher switching losses.
+
+  PWM.EnableOutput();
 
   for (;;) {
-    PIC.Reference = PIDtRef;
+    PIC.reference = PIDtRef;
     PIC.Calculate(*CurPressure);
-    PWM.DutyCycle = PIC.Output;
+    PWM.DutyCycle = PIC.output;
     PWM.Execute();
+    vTaskDelay(piControllerStepSize / portTICK_PERIOD_MS); // Sleep 10 ms
   }
   vTaskDelete(NULL);
 }
@@ -822,13 +831,15 @@ void PressurePIController(void * parameters) {
   // Define Ranges for unit conversion
   float OutputRange[] = {0, float(range)};
 
-  PI_Controller PIC = PI_Controller(4, 0.4, OutputRange, 10);
+  unsigned int piControllerStepSize = 25;
+
+  PI_Controller PIC = PI_Controller(1, 0.1, OutputRange, 10, piControllerStepSize);
 
   for (;;) {
-    PIC.Reference = PIDPRef;
+    PIC.reference = PIDPRef;
     PIC.Calculate(*CurPressure);
-    pump.set(int(PIC.Output));
-    vTaskDelay( 25 / portTICK_PERIOD_MS);
+    pump.set(int(PIC.output));
+    vTaskDelay( piControllerStepSize / portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
 }
@@ -883,9 +894,9 @@ void setup(){
   BoilerReference = &PIDtRef;
   PressureReference = &PIDPRef;
 
-  //pinMode(relayPin, OUTPUT);
-  //pinMode(brewPin, INPUT_PULLUP);
-  //pinMode(steamPin, INPUT_PULLUP);
+  pinMode(relayPin, OUTPUT);
+  pinMode(brewPin, INPUT_PULLUP);
+  pinMode(steamPin, INPUT_PULLUP);
 
   pinMode(PressurePin, INPUT_PULLDOWN);
 
@@ -910,7 +921,6 @@ void setup(){
     CONFIG_ARDUINO_RUNNING_CORE
   );
 
-  
   xTaskCreatePinnedToCore(
     RunMainStateMachine,
     "StateMachineTask",
@@ -940,6 +950,7 @@ void setup(){
     &PressureUpdateTask,
     !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
   );
+
   xTaskCreatePinnedToCore(
     BoilerPIController,
     "Boiler PI Controller Task",
@@ -949,6 +960,7 @@ void setup(){
     &BoilerPITask,
     !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
   );
+
   xTaskCreatePinnedToCore(
     PressurePIController,
     "Pressure PI Controller Task",
