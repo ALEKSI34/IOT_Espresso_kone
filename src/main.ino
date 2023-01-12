@@ -8,11 +8,15 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJSON.h>
+#include <ArduinoOTA.h>
 #include <EEPROM.h>
-#include <max6675.h>
-#include "RTOS_PSM.h"
-#include "PI.h"
-#include "PWM_Relay.h"
+#include <RTOS_PSM.h>
+#include <PI.h>
+#include <PWM_Relay.h>
+#include "webpage.h"
+#include "wifi_secrets.h"
+
+
 
 // IO
 #define relayPin 25 // Pin checked, Connect a port here. Port Component.
@@ -27,28 +31,28 @@
 #define thermoCS 23 // Pin Checked, MOSI/ V_SPI_D, Connect SS/CS
 #define thermoCLK 5 // Pin checked, V_SPI_CS0, Connect SCK
 
-SemaphoreHandle_t IOTSemaphore = xSemaphoreCreateMutex();
+SemaphoreHandle_t IOTSemaphore = xSemaphoreCreateBinary();
 
-MAX6675 thermocouple(thermoCLK, thermoCS, thermoMISO);
+//MAX6675 thermocouple(thermoCLK, thermoCS, thermoMISO);
 
 const uint8_t range = 100;
-RTOS_PSM pump(sensePin, dimmerControlPin, range, RISING, 2, 4);
+RTOS_PSM* pump;
 
 // Replace with your network credentials
-const char* ssid = "KRP 01";
-const char* password = "Salasana1";
+const char* ssid = SSID;
+const char* password = WIFI_PASSWORD;
 
 StaticJsonDocument<200> doc;
 StaticJsonDocument<200> GeneralDoc;
 
 hw_timer_t * updateTimer = NULL;
 
-TaskHandle_t WebServerTask, StateMachineTask, ControllerTask, KTypeUpdateTask, PressureUpdateTask, BoilerPITask, PressurePITask;
+TaskHandle_t WebServerTask, OTATaskHandle, StateMachineTask, ControllerTask, KTypeUpdateTask, PressureUpdateTask, BoilerPITask, PressurePITask;
 
 volatile uint8_t NO_INPUT, DATA_STORED = 0;
 
-float_t PIDtRef, PIDPRef;
-float_t *BoilerReference, *PressureReference;
+float_t BoilerReference, PressureReference = 0.0;
+float_t temperatureReferenceOffset = 8.0; // Add the reference offset for gaggia classic.
 
 uint8_t BrewCounter = 0; // When 1, count the brew counter.
 float_t currentTime = 0; // Current running time of the ESP32. In float, as seconds, accuracy 0.5s
@@ -56,6 +60,15 @@ float_t brewTime = 0; // Current time of brewing
 float_t brewTimeT0 = 0; // Brewing start time
 
 typedef struct { String key; int val; } t_dictionary;
+
+const String StateString[] = {
+  "HEATING",
+  "PREINFUSING",
+  "BREWING",
+  "STEAMING",
+  "OVERHEATED"
+};
+
 
 enum States {
   HEATING = 0,
@@ -66,14 +79,6 @@ enum States {
 };
 
 States StateMachineState = HEATING;
-
-const char *StateStrings[4] = {
-  "HEATING",
-  "PREINFUSING",
-  "BREWING",
-  "STEAMING"
-};
-
 enum Variables {
   TEMP = 0,
   BREWTIME = 1,
@@ -122,8 +127,8 @@ t_EspressoItem EspressoIOTArray[] = {
 };
 uint8_t EspIOTArrLen = 10;
 // Pointers for easier access of these variables.
-float_t *CurPressure = &EspressoIOTArray[2].value; // Pointer to Current Pressure value
-float_t *CurTemp = &EspressoIOTArray[0].value; // Pointer to Current Temperature value
+float_t *CurPressure = &EspressoIOTArray[PRESSURE].value; // Pointer to Current Pressure value
+float_t *CurTemp = &EspressoIOTArray[TEMP].value; // Pointer to Current Temperature value
 
 // Stuff stored to EEPROM, initialized to 0.0, updated from old values from eeprom.
 t_EspressoItem BrewParameters[] = {
@@ -140,282 +145,6 @@ const uint8_t ParameterCount = 7;
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
-
-// Whole webpage here btw.
-// Uses google charts for plotting, so internet connection required for your device.
-// Should still work without one idk, haven't tested
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="icon" href="data:,">
-  <style>
-  html {
-    font-family: Arial, Helvetica, sans-serif;
-    text-align: center;
-  }
-  h1 {
-    font-size: 1.8rem;
-    color: white;
-  }
-  h2{
-    font-size: 1.5rem;
-    font-weight: bold;
-    color: #143642;
-  }
-  .topnav {
-    overflow: hidden;
-    background-color: #143642;
-  }
-  body {
-    margin: 0;
-  }
-  .content {
-    padding: 30px;
-    max-width: 600px;
-    margin: 0 auto;
-  }
-  .card {
-    background-color: #F8F7F9;;
-    box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5);
-    padding-top:10px;
-    padding-bottom:20px;
-    margin-bottom:15px;
-  }
-  .slidecontainer {
-    width: 100%; /* Width of the outside container */
-  }
-  .slider {
-    -webkit-appearance: none;  /* Override default CSS styles */
-    appearance: none;
-    width: 100%; /* Full-width */
-    display: flex;
-    flex-direction: column;
-    height: 20px;
-    border-radius: 5px;   
-    background: #d3d3d3; /* Grey background */
-    outline: none; /* Remove outline */
-    opacity: 0.7; /* Set transparency (for mouse-over effects on hover) */
-    -webkit-transition: .2s; /* 0.2 seconds transition on hover */
-    transition: opacity .2s;
-  }
-  /* The slider handle (use -webkit- (Chrome, Opera, Safari, Edge) and -moz- (Firefox) to override default look) */
-  .slider::-webkit-slider-thumb {
-    -webkit-appearance: none; /* Override default look */
-    appearance: none;
-    width: 25px; /* Set a specific slider handle width */
-    height: 25px; /* Slider handle height */
-    background: #0f8b8d; /* Green background */
-    cursor: pointer; /* Cursor on hover */
-  }
-  .slider::-moz-range-thumb {
-    width: 30px;
-    height: 30px;
-    border-radius: 10px;
-    background: #0f8b8d;
-    cursor: pointer;
-  }
-  .button {
-    padding: 15px 50px;
-    font-size: 24px;
-    text-align: center;
-    outline: none;
-    color: #fff;
-    background-color: #0f8b8d;
-    border: none;
-    border-radius: 5px;
-    -webkit-touch-callout: none;
-    -webkit-user-select: none;
-    -khtml-user-select: none;
-    -moz-user-select: none;
-    -ms-user-select: none;
-    user-select: none;
-    -webkit-tap-highlight-color: rgba(0,0,0,0);
-   }
-   /*.button:hover {background-color: #0f8b8d}*/
-   .button:active {
-     background-color: #0f8b8d;
-     box-shadow: 2 2px #CDCDCD;
-     transform: translateY(2px);
-   }
-   .state {
-     font-size: 1.5rem;
-     color:#8c8c8c;
-     font-weight: bold;
-   }
-  </style>
-<title>Gaggia Classic Pro</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="data:,">
-</head>
-<body>
-  <div class="topnav">
-    <h1>IOT ESPRESSOKEITIN</h1>
-  </div>
-  <div class="content">
-    <div class="card">
-      <h2>General Information</h2>
-      <p class="value">On-time: <span id="ONTIME">%ONTIME%</span></p>
-      <p class="value">Temperature: <span id="TEMP">%TEMP%</span></p>
-      <p class="value">Brew Time: <span id="BREWTIME">%BREWTIME%</span></p>
-      <p class="value">Pressure: <span id="PRESSURE">%PRESSURE%</span></p>
-      <p class="value">State: <span id="STATE">%STATE%</span></p>
-    </div>
-    <div id='chart_div', style='height: 400px'></div>
-    
-    <div class="card">
-      <h2>Heating Parameters:</h2>
-      <p class="value">Brew Temperature: <span id="BREWTEMPREF">%BREWTEMPREF%</span></p>
-      <div class="slidecontainer">
-        <input type="range" min="80" max="110" value="95" class="slider" onchange="updateVal('BREWTEMPREF',this.value)">
-      </div>
-      <p class="value">Steam Temperature: <span id="STEAMTEMPREF">%STEAMTEMPREF%</span></p>
-      <div class="slidecontainer">
-        <input type="range" min="120" max="155" value="145" class="slider" onchange="updateVal('STEAMTEMPREF',this.value)">
-      </div>
-    </div>
-    
-    <div class="card">
-      <h2>Brewing Parameters</h2>
-      <p class="value">Pre-Infusion [s]: <span id="PREINFTIME">%PREINFTIME%</span></p>
-      <div class="slidecontainer">
-        <input type="range" min="0" max="15" value="8" class="slider" onchange="updateVal('PREINFTIME',this.value)">
-      </div>
-      <p class="value">Pre-Infusion [bar]: <span id="PREINFBAR">%PREINFBAR%</span></p>
-      <div class="slidecontainer">
-        <input type="range" min="1" max="10" value="2" step="0.25" class="slider" onchange="updateVal('PREINFBAR',this.value)">
-      </div>
-      <p class="value">Brew [s]: <span id="BREWTIMEREF">%BREWTIMEREF%</span></p>
-      <div class="slidecontainer">
-        <input type="range" min="10" max="45" value="30" class="slider" onchange="updateVal('BREWTIMEREF',this.value)">
-      </div>
-      <p class="value">Brew Initial [bar]: <span id="BREWPRESSUREINIT">%BREWPRESSUREINIT%</span></p>
-      <div class="slidecontainer">
-        <input type="range" min="1" max="10" value="9" step="0.25" class="slider" onchange="updateVal('BREWPRESSUREINIT',this.value)">
-      </div>
-      <p class="value">Brew Final [bar]: <span id="BREWPRESSUREEND">%BREWPRESSUREEND%</span></p>
-      <div class="slidecontainer">
-        <input type="range" min="1" max="10" value="8" step="0.25" class="slider" onchange="updateVal('BREWPRESSUREEND',this.value)">
-      </div>
-    </div>
-  </div>
-<script type='text/javascript' src='https://www.gstatic.com/charts/loader.js'></script>
-<script>
-  var gateway = `ws://${window.location.hostname}/ws`;
-  var websocket;
-  window.addEventListener('load', onLoad);
-
-  google.charts.load('current', {
-    packages: ['corechart','line']
-  });
-  google.charts.setOnLoadCallback(drawChart);
-
-  function initWebSocket() {
-    console.log('Trying to open a WebSocket connection...');
-    websocket = new WebSocket(gateway);
-    websocket.onopen    = onOpen;
-    websocket.onclose   = onClose;
-    websocket.onmessage = onMessage;
-  }
-  function updateVal(Key_in,Value_in) {
-    var Unit = {
-      Key: Key_in,
-      Value: Value_in
-    };
-    websocket.send(JSON.stringify(Unit));
-  }
-  function onOpen(event) {
-    console.log('Connection opened');
-  }
-  function onClose(event) {
-    console.log('Connection closed');
-    setTimeout(initWebSocket, 2000);
-  }
-  function onMessage(event) {
-    var state;
-    var message = JSON.parse(event.data);
-    if (message.hasOwnProperty('Key')){
-      document.getElementById(message.Key).innerHTML = message.Value;
-    } else {
-      updateChart(message);
-    }
-  }
-  function onLoad(event) {
-    initWebSocket();
-  }
-  var data;
-  var options;
-  var chart;
-  function drawChart() {
-    data = google.visualization.arrayToDataTable([
-      ['Second', 'Brew Pressure', 'Boiler Temperature'],
-      [0, 0, 22]
-    ]);
-      // create options object with titles, colors, etc.
-    options = {
-      title: 'Real-Time Monitoring',
-      curveType: 'function',
-      legend: { position: 'none'},
-      intervals: {'style':'line'},
-      animation: {
-        duration: 500
-      },
-      series: {
-        0: {targetAxisIndex: 0},
-        1: {targetAxisIndex: 1}
-      },
-      hAxis: {
-        title: 'Time [s]',
-        minValue: 0,
-        gridlines: {interval : [1, 2, 2.5, 5]},
-        scaleType: 'linear',
-        viewWindow : {max: 60}
-      },
-      vAxes: {
-        0: {title: 'Pressure (bar)',
-            logScale: false,
-            maxValue: 10},
-        1: {title: 'Temperature (Celsius)',
-            logScale: false, 
-            maxValue: 160}
-      }
-    };
-    // draw chart on load
-    chart = new google.visualization.LineChart(
-      document.getElementById('chart_div')
-    );
-    chart.draw(data, options);
-  }
-  var PrevKey = "";
-  function updateChart(message) {
-    let Time = JSON.parse(message.Time);
-    let Pressure = JSON.parse(message.Pressure);
-    let Temperature = JSON.parse(message.Temperature);
-
-    let T_val = parseFloat(Time.Value);
-    let P_val = parseFloat(Pressure.Value);
-    let Temp_val = parseFloat(Temperature.Value);
-
-    if (PrevKey != Time.Key) {
-      data.removeRows(0,data.getNumberOfRows());
-    }
-
-    PrevKey = Time.Key;
-
-    data.addRow([T_val, P_val, Temp_val]);
-    if (T_val > 60) {
-        options.hAxis.viewWindow = { min: T_val-60, max: T_val};
-    } 
-    if (data.getNumberOfRows() > (75/0.5)){
-      data.removeRow(0);
-    }
-    chart.draw(data,options);
-  }
-</script>
-</body>
-</html>
-)rawliteral";
-
 
 int keyfromstring(const String& var){
   int i = 0;
@@ -489,13 +218,13 @@ String SecondsToString(int32_t seconds) {
   return Minutes + " min "+ Seconds + " s";
 }
 
-float_t InterpolateValueOnCurve(float_t xn,float_t y0, float_t y1, float_t x1) {
+float_t InterpolateValueOnCurve(float_t xn,float_t y0, float_t y1, float_t x0, float_t x1) {
   // Simple linear interpolation implementation
   if (xn > x1) {
     return y1;
   } 
   else {
-    return y0+(xn)*((y1-y0)/(x1));
+    return y0 + (xn - x0) * (y1 - y0) / (x1 - x0);
   }
 }
 
@@ -506,10 +235,34 @@ float_t InterpolateValueOnCurve(float_t xn,float_t y0, float_t y1, float_t x1) {
 String FormJSONMessage (String Key, String Value) {
   String jsonString = "";
   JsonObject object = doc.to<JsonObject>();
-  object["Key"] = Key;
-  object["Value"] = Value;
+  if (Key != NULL) 
+  {
+    object["Key"] = Key;
+  }
+  else{
+    object["Key"] = "MISC";
+  }
+    if (Value != NULL) 
+  {
+    object["Value"] = Value;
+  }
+  else
+  {
+    object["Value"] = "MISC";
+  }
   serializeJson(doc, jsonString);
   return jsonString;
+}
+
+String mergeJSONMessage (const std::vector<String>& jsonList)
+{
+    String result = "[";
+    for (const String& json : jsonList) {
+        result += json + ",";
+    }
+    result.remove(result.length() - 1);
+    result += "]";
+    return result;
 }
 
 void handleWebSocketMessage(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len) {
@@ -519,10 +272,7 @@ void handleWebSocketMessage(AsyncWebSocket * server, AsyncWebSocketClient * clie
     
     DeserializationError error = deserializeJson(doc, data);
 
-    if (error) {
-      Serial.print(F("deserializeJson() failed: "));
-      Serial.println(error.f_str());
-    } else {
+    if (!error) {
       UpdateInternalValue(doc["Key"],doc["Value"]);
       ws.textAll(FormJSONMessage(doc["Key"],doc["Value"]));
       DATA_STORED = 0; // Flag for plausible data update.
@@ -565,13 +315,8 @@ String processor(const String& var){
   return String();
 }
 
-uint8_t IfUpdate = 0;
-
-void onUpdate(void){
-  IfUpdate = 1;
-}
-
 String GetGeneralInformationSerialized(uint8_t bBrewing) {
+  // Sends objects the plotting
   String jsonString = "";
   JsonObject object = GeneralDoc.to<JsonObject>();
   if (bBrewing) { 
@@ -579,20 +324,13 @@ String GetGeneralInformationSerialized(uint8_t bBrewing) {
   } else {
     object["Time"] = FormJSONMessage(StringfromEnum(ONTIME),String(currentTime));
   }
-  object["Pressure"] = FormJSONMessage(StringfromEnum(PRESSURE),String(EspressoIOTArray[2].value));
-  object["Temperature"] = FormJSONMessage(StringfromEnum(TEMP),String(EspressoIOTArray[0].value));
+  object["Pressure"] = FormJSONMessage(StringfromEnum(PRESSURE),String(EspressoIOTArray[PRESSURE].value));
+  object["Temperature"] = FormJSONMessage(StringfromEnum(TEMP),String(EspressoIOTArray[TEMP].value));
   serializeJson(GeneralDoc, jsonString);
   return jsonString;
 }
 
 void SetupWebServer(void * parameters) {
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi..");
-  }
-
   // Print ESP Local IP Address
   Serial.println(WiFi.localIP());
 
@@ -608,31 +346,62 @@ void SetupWebServer(void * parameters) {
 
   static float_t referenceSec = 0.0;
 
+  String jsonmessage;
+  String generalInformation;
+  String stateString;
+  String currentTimeString, stateMachineString, temperatureString, pressureString, brewTimeString;
+
+  Serial.println("Webserver Initialized");
+
+  xSemaphoreGive(IOTSemaphore); // Semaphore must be given so the program loop can start.
+
+  uint8_t i;
   for (;;) {
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
     ws.cleanupClients();
     currentTime += 0.5; // Visual time hacky hack
-    ws.textAll(FormJSONMessage(StringfromEnum(ONTIME),SecondsToString(currentTime)));
-    ws.textAll(FormJSONMessage(StringfromEnum(STATE),String(StateStrings[StateMachineState])));
-
-    xSemaphoreTake( IOTSemaphore, portMAX_DELAY);
+    stateString = StateString[StateMachineState];
+    if (stateString == NULL) {
+      stateString = String("MISC");
+    }
+    currentTimeString = FormJSONMessage(StringfromEnum(ONTIME),SecondsToString(currentTime)); // currentTime
+    stateMachineString = FormJSONMessage(StringfromEnum(STATE),stateString); //StateMachineState
+    temperatureString = FormJSONMessage(StringfromEnum(TEMP),String(*CurTemp));
+    pressureString = FormJSONMessage(StringfromEnum(PRESSURE),String(*CurPressure));
     if (BrewCounter) {
       EspressoIOTArray[BREWTIME].value = currentTime-brewTimeT0;
     } else {
       brewTimeT0 = currentTime;
       EspressoIOTArray[BREWTIME].value = 0.0;
     }
-    xSemaphoreGive( IOTSemaphore);
+    brewTimeString = FormJSONMessage(StringfromEnum(BREWTIME),SecondsToString(EspressoIOTArray[BREWTIME].value));
+    generalInformation = GetGeneralInformationSerialized(BrewCounter);
 
-    ws.textAll(FormJSONMessage(StringfromEnum(BREWTIME),SecondsToString(EspressoIOTArray[BREWTIME].value)));
-    ws.textAll(GetGeneralInformationSerialized(BrewCounter));
+    jsonmessage = mergeJSONMessage(
+      {
+        currentTimeString,
+        stateMachineString,
+        temperatureString,
+        pressureString,
+        brewTimeString
+      }
+    );
 
+    ws.textAll(jsonmessage);
+    ws.textAll(generalInformation);
+
+
+    xSemaphoreGive(IOTSemaphore);
 
     vTaskDelay( 500 / portTICK_PERIOD_MS );
+
     if (NO_INPUT) {
       if (currentTime-referenceSec > 15 ) {
         if (!DATA_STORED) {
+          xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
           UpdateParametersArray();
           StoreParametersToEEPROM(0);
+          xSemaphoreGive(IOTSemaphore);
         }
       }
     } else {
@@ -650,14 +419,14 @@ void SetupWebServer(void * parameters) {
 void HeatingState() {
   // HEATING STATE //
   digitalWrite(relayPin, LOW);
-  *BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
-  *PressureReference = 0.0;
+  BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
+  PressureReference = 0.0;
 }
 
 void SteamingState() {
   // STEAMING STATE //
-  *BoilerReference = EspressoIOTArray[STEAMTEMPREF].value;
-  *PressureReference = 0.0;
+  BoilerReference = EspressoIOTArray[STEAMTEMPREF].value;
+  PressureReference = 0.0;
 }
 
 void PreInfusingState() {
@@ -665,21 +434,22 @@ void PreInfusingState() {
 
   BrewCounter = 1;
 
-  *PressureReference = EspressoIOTArray[PREINFBAR].value;
-  *BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
+  PressureReference = EspressoIOTArray[PREINFBAR].value;
+  BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
 }
 
 void BrewingState() {
   // BREWING STATE //
   BrewCounter = 1;
 
-  *BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
+  BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
 
   // Update Pressure reference accordingly.
-  *PressureReference = InterpolateValueOnCurve(
+  PressureReference = InterpolateValueOnCurve(
     brewTime, 
     EspressoIOTArray[BREWPRESSUREINIT].value,
     EspressoIOTArray[BREWPRESSUREEND].value,
+    EspressoIOTArray[PREINFTIME].value,
     EspressoIOTArray[BREWTIMEREF].value  
   );
 }
@@ -687,18 +457,20 @@ void BrewingState() {
 void OverheatingState() {
   // STEAMING STATE //
   digitalWrite(relayPin, LOW);
-  *BoilerReference = 0.0;
-  *PressureReference = 0.0;
+  BoilerReference = 0.0;
+  PressureReference = 0.0;
 }
 
 void RunMainStateMachine(void * parameters)  {
+
+  Serial.println("Statemachine Initialized");
+
   for (;;) {
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
 
     uint8_t BrewSwitch = digitalRead(brewPin);
     uint8_t SteamSwitch = digitalRead(steamPin);
     uint8_t PreInfusingEnabled = (EspressoIOTArray[PREINFTIME].value > 0.5);
-
-    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
     // Main state machine
 
     // Check for overheating
@@ -726,9 +498,19 @@ void RunMainStateMachine(void * parameters)  {
       break;
     case PREINFUSING:
       brewTime += 0.05;
-      if (PreInfusingEnabled) {
+      if (!BrewSwitch) {
+        StateMachineState = HEATING;
+      }
+      else if (brewTime >= EspressoIOTArray[PREINFTIME].value) 
+      {
+        StateMachineState = BREWING;
+      }
+      else if (PreInfusingEnabled) 
+      {
         PreInfusingState();
-      } else {
+      }
+      else 
+      {
         StateMachineState = BREWING;
       }
       break;
@@ -747,6 +529,7 @@ void RunMainStateMachine(void * parameters)  {
       else {
         StateMachineState = HEATING;
       }
+      break;
     }
 
     EspressoIOTArray[STATE].value = StateMachineState;
@@ -761,19 +544,82 @@ void RunMainStateMachine(void * parameters)  {
 //// SENSOR UPDATE STUFF ////
 /////////////////////////////
 
+byte spiread(void) {
+  int i;
+  byte d = 0;
+
+  for (i=7; i>=0; i--)
+  {
+    digitalWrite(thermoCLK, LOW);
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+    if (digitalRead(thermoMISO)) {
+      //set the bit to 0 no matter what
+      d |= (1 << i);
+    }
+
+    digitalWrite(thermoCLK, HIGH);
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+  }
+
+  return d;
+}
+
+
 float_t kThermoread(){
-  return float_t(85.0); //thermocouple.readCelsius();
+  uint16_t v;
+
+  digitalWrite(thermoCS, LOW);
+
+  vTaskDelay(1 / portTICK_PERIOD_MS);
+
+  v = spiread();
+  v <<= 8;
+  v |= spiread();
+
+  digitalWrite(thermoCS, HIGH);
+  vTaskDelay(1 / portTICK_PERIOD_MS);
+
+  if (v & 0x4) {
+    return NAN;
+  }
+  v >>= 3;
+
+  return (float_t) v*0.25;
+  //return float_t(thermocouple.readCelsius()); //thermocouple.readCelsius();
 }
 
 void UpdateKTypeTemp(void * parameters) {
   // Temperature value arrives via SPI from MAX6675
+  float_t temperature;
+
+  Serial.println("Temperature sensor Initialized");
+
   for (;;) {
+    temperature = kThermoread();
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
-    *CurTemp = kThermoread();
+    *CurTemp = temperature;
     xSemaphoreGive(IOTSemaphore);
-    vTaskDelay(250 / portTICK_PERIOD_MS);
+    vTaskDelay(500 / portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
+}
+
+float_t PressureTransducerVoltage() {
+  // ESP32 has black zones in 0-0.1V and 3.2V-3.3V.
+  uint16_t measurement = analogRead(PressurePin);
+  float_t espVoltage;
+  if (measurement <= 0) 
+  {
+    espVoltage = 0.1;
+  } else if (measurement >= 4095) 
+  {
+    espVoltage = 3.2;
+  }
+  else
+  {
+    espVoltage = float(measurement)/4096 * (3.1) + 0.1;
+  }
+  return espVoltage * (5.0/3.3);
 }
 
 void UpdatePressure(void * parameters) {
@@ -784,15 +630,18 @@ void UpdatePressure(void * parameters) {
   float_t Offset = 0.5; // Volts
   float_t MaxBar = 12; // Bar
   float_t Range = 4; // Volts
-  float_t Prev_Voltage = (analogRead(PressurePin)*5.0)/1024.0;
+  float_t Prev_Voltage = PressureTransducerVoltage();
+
+  Serial.println("Pressure sensor Initialized");
+
   for(;;) {
-    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
-    float_t Voltage = (analogRead(PressurePin)*5.0)/1024.0;
+    float_t Voltage = PressureTransducerVoltage();
     // Update the current pressure. Use average of 2 previous measurements as the voltage value, for some filtering.
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
     *CurPressure = MaxBar*((((Voltage+Prev_Voltage)/2)-Offset)/Range);
-    Prev_Voltage = Voltage;
     xSemaphoreGive(IOTSemaphore);
-    vTaskDelay(5 / portTICK_PERIOD_MS);
+    Prev_Voltage = Voltage;
+    vTaskDelay(12.5 / portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
 }
@@ -815,12 +664,17 @@ void BoilerPIController(void * parameters) {
 
   PWM.EnableOutput();
 
+  Serial.println("Boiler PI Initialized");
+
   for (;;) {
-    PIC.reference = PIDtRef;
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
+    PIC.reference = BoilerReference+temperatureReferenceOffset; // Add 
     PIC.Calculate(*CurPressure);
     PWM.DutyCycle = PIC.output;
     PWM.Execute();
+    xSemaphoreGive(IOTSemaphore);
     vTaskDelay(piControllerStepSize / portTICK_PERIOD_MS); // Sleep 10 ms
+
   }
   vTaskDelete(NULL);
 }
@@ -835,10 +689,14 @@ void PressurePIController(void * parameters) {
 
   PI_Controller PIC = PI_Controller(1, 0.1, OutputRange, 10, piControllerStepSize);
 
+  Serial.println("Pressure PI Initialized");
+
   for (;;) {
-    PIC.reference = PIDPRef;
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
+    PIC.reference = PressureReference;
     PIC.Calculate(*CurPressure);
-    pump.set(int(PIC.output));
+    pump->set(int(PIC.output));
+    xSemaphoreGive(IOTSemaphore);
     vTaskDelay( piControllerStepSize / portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
@@ -886,31 +744,63 @@ void GetParametersFromEEPROM(uint8_t FirstAddress){
   Serial.printf("-----------------------\n");
 }
 
+//////////////////////
+////  OTA TASK    ////
+//////////////////////
+
+void HandleOTAUpdates(void *pvParameters) {
+  for (;;)
+  {
+    ArduinoOTA.poll();
+    vTaskDelay(1000/ portTICK_PERIOD_MS);
+  }
+  vTaskDelete(NULL);
+}
+
 void setup(){
   // Serial port for debugging purposes
   Serial.begin(115200);
   EEPROM.begin(30); // We don't need more that 30 bytes
 
-  BoilerReference = &PIDtRef;
-  PressureReference = &PIDPRef;
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi..");
+  }
 
+  // Initialize OTA
+  ArduinoOTA.begin(WiFi.localIP(), "Arduino", "password", InternalStorage);
+  ArduinoOTA.onStart([]() {Serial.println("Starting over the air update...");});
+  ArduinoOTA.onError([](int code, const char *msg) 
+    {
+      Serial.println("Error occured during OTA");
+      Serial.println("Error code: "+ code);
+      Serial.println("Message: ");
+    });
+  Serial.println("OTA begin triggered. Auth: Arduino:password");
+  
+  // Initialize I/O
   pinMode(relayPin, OUTPUT);
-  pinMode(brewPin, INPUT_PULLUP);
-  pinMode(steamPin, INPUT_PULLUP);
+  pinMode(brewPin, INPUT_PULLDOWN); // INPUT_PULLUP
+  pinMode(steamPin, INPUT_PULLDOWN); // INPUT_PULLUP
 
   pinMode(PressurePin, INPUT_PULLDOWN);
 
+  // Initialize MAX6675
+  pinMode(thermoCS, OUTPUT);
+  pinMode(thermoCLK, OUTPUT);
+  pinMode(thermoMISO, INPUT);
+
+  digitalWrite(thermoCS,HIGH);
+
+  // Get stuff from EEPROM
   uint8_t ParametersEEAddress = 0;
-
   GetParametersFromEEPROM(ParametersEEAddress); // Load up parameters from EEPROM
-
   SyncParametersToLive();
-
-  updateTimer = timerBegin(1, 80, true);
-  timerAttachInterrupt(updateTimer, &onUpdate, true);
-  timerAlarmWrite(updateTimer, 1000000, true);
-  timerAlarmEnable(updateTimer);
   
+  pump = new RTOS_PSM(sensePin, dimmerControlPin, range, RISING, 2, 4); // Pump initializes new task. Initializing before setup, causes memory leaks and errors
+
   xTaskCreatePinnedToCore(
     SetupWebServer,
     "WebServerTask",
@@ -918,6 +808,16 @@ void setup(){
     NULL,
     2,
     &WebServerTask,
+    CONFIG_ARDUINO_RUNNING_CORE
+  );
+
+  xTaskCreatePinnedToCore(
+    HandleOTAUpdates,
+    "OTAHandlerTask",
+    8192,
+    NULL,
+    1,
+    &OTATaskHandle,
     CONFIG_ARDUINO_RUNNING_CORE
   );
 
@@ -973,5 +873,5 @@ void setup(){
 }
 
 void loop() {
-
+  // Loop function is empty. RTOS handles running tasks.
 }

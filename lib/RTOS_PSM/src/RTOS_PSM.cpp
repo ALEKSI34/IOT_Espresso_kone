@@ -49,9 +49,9 @@ void RTOS_PSM::InterruptTask(void * parameters)
         if (xSemaphoreTake(PSMInterruptSemaphore, portMAX_DELAY) == pdTRUE)
         {
             pRTOS_PSM->InterruptHandler();
-            xSemaphoreGive(PSMInterruptSemaphore);
         }
     }
+	vTaskDelete(NULL);
 }
 void RTOS_PSM::InterruptHandler()
 {
