@@ -16,8 +16,6 @@
 #include "webpage.h"
 #include "wifi_secrets.h"
 
-
-
 // IO
 #define relayPin 25 // Pin checked, Connect a port here. Port Component.
 #define brewPin 12 // Pin checked, Connect brew button here. Port Component.
@@ -386,12 +384,10 @@ void SetupWebServer(void * parameters) {
         brewTimeString
       }
     );
+    xSemaphoreGive(IOTSemaphore);
 
     ws.textAll(jsonmessage);
     ws.textAll(generalInformation);
-
-
-    xSemaphoreGive(IOTSemaphore);
 
     vTaskDelay( 500 / portTICK_PERIOD_MS );
 
@@ -751,7 +747,7 @@ void GetParametersFromEEPROM(uint8_t FirstAddress){
 void HandleOTAUpdates(void *pvParameters) {
   for (;;)
   {
-    ArduinoOTA.poll();
+    ArduinoOTA.handle();
     vTaskDelay(1000/ portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
@@ -770,14 +766,12 @@ void setup(){
   }
 
   // Initialize OTA
-  ArduinoOTA.begin(WiFi.localIP(), "Arduino", "password", InternalStorage);
+  
+
   ArduinoOTA.onStart([]() {Serial.println("Starting over the air update...");});
-  ArduinoOTA.onError([](int code, const char *msg) 
-    {
-      Serial.println("Error occured during OTA");
-      Serial.println("Error code: "+ code);
-      Serial.println("Message: ");
-    });
+  ArduinoOTA.setPort(3232);
+  ArduinoOTA.setPassword((const char *)"password");
+  ArduinoOTA.begin();
   Serial.println("OTA begin triggered. Auth: Arduino:password");
   
   // Initialize I/O
