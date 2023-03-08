@@ -4,7 +4,7 @@
 #include "Arduino.h"
 
 PWM_Relay::PWM_Relay (
- unsigned int RelayPin, unsigned int frequency, unsigned int _stepsize
+ unsigned int RelayPin, unsigned int frequency
 ) :
     _RelayPin(RelayPin),
     _basefrequency(frequency),
@@ -19,21 +19,15 @@ void PWM_Relay::Execute()
         return;
     }
 
-    static float pwmPeriod = 1000.0/float(this->_basefrequency); // Period of one PWM. in ms
-    static int stepsToPeriod = int(pwmPeriod)/this->_stepsize;
-    static int loop = 0;
-    
-    if (loop >= stepsToPeriod){
-        loop = 0;
-    }
+    static float PWM_PERIOD = PWM_RESOLUTION/double(this->_basefrequency); // Period of one PWM. in ms
 
-    if (loop < (stepsToPeriod*DutyCycle)){
-        digitalWrite(this->_RelayPin, HIGH);
-    } else {
-        digitalWrite(this->_RelayPin, LOW);
+    for (int i = 0; i < PWM_PERIOD; i++) {
+        if (i < (DutyCycle * PWM_PERIOD / PWM_RESOLUTION)) {
+            digitalWrite(this->_RelayPin, HIGH);
+        } else {
+            digitalWrite(this->_RelayPin, LOW);
+        }
     }
-
-    loop += 1;
 }
 void PWM_Relay::EnableOutput() {
     this->_enabled = true;

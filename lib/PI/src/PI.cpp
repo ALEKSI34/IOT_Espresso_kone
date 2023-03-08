@@ -20,7 +20,7 @@ float PI_Controller::Calculate(float input)
 {
     if (!_enabled) return 0;
 
-    float error = input - reference;
+    float error = reference - input;
     float P = _Kp * error;
 
     _integral += error * float(_DT);

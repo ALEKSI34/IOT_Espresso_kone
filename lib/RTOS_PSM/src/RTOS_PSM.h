@@ -10,7 +10,7 @@ class RTOS_PSM
 public:
 	RTOS_PSM(unsigned char sensePin, unsigned char controlPin, unsigned int range, int mode = RISING, unsigned char divider = 1, unsigned char interruptMinTimeDiff = 0);
 
-	void set(unsigned int value);
+	void set(int value);
 
 	long getCounter();
 	void resetCounter();
@@ -37,9 +37,6 @@ private:
 	volatile long _counter;
 	volatile long _stopAfter;
 	volatile unsigned long _lastMillis;
-
-
-    TaskHandle_t xInterruptTaskHandle;
 
     static void InterruptTask(void * parameters);
     static inline void onInterrupt(void);

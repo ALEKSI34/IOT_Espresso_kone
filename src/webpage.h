@@ -256,7 +256,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     );
     chart.draw(data, options);
   }
-  var PrevKey = "";
+  var PrevTime = null;
   function updateChart(message) {
     let Time = JSON.parse(message.Time);
     let Pressure = JSON.parse(message.Pressure);
@@ -266,19 +266,41 @@ const char index_html[] PROGMEM = R"rawliteral(
     let P_val = parseFloat(Pressure.Value);
     let Temp_val = parseFloat(Temperature.Value);
 
-    if (PrevKey != Time.Key) {
+    if (PrevTime !=  null && T_val < PrevTime) {
       data.removeRows(0,data.getNumberOfRows());
+      options.hAxis.viewWindow = { min: T_val - 60, max: T_val };
     }
 
-    PrevKey = Time.Key;
+    PrevTime = T_val;
 
     data.addRow([T_val, P_val, Temp_val]);
-    if (T_val > 60) {
-        options.hAxis.viewWindow = { min: T_val-60, max: T_val};
-    } 
+
     if (data.getNumberOfRows() > (75/0.5)){
       data.removeRow(0);
     }
+
+    // Update the viewWindow to show the most recent 60 seconds of data
+    let lastTime = parseFloat(data.getValue(data.getNumberOfRows()-1, 0));
+    let firstTime = parseFloat(data.getValue(0, 0));
+    let timeRange = lastTime - firstTime;
+
+    if (timeRange > 60) {
+      options.hAxis.viewWindow = { min: lastTime - 60, max: lastTime };
+    } else {
+      options.hAxis.viewWindow = { min: firstTime, max: lastTime };
+    }
+
+    // Update the viewWindow for the vertical axes
+    let P_min = data.getColumnRange(1).min;
+    let P_max = data.getColumnRange(1).max;
+    let P_range = P_max - P_min;
+    options.vAxes[0].viewWindow = { min: P_min - P_range * 0.1, max: P_max + P_range * 0.1 };
+
+    let Temp_min = data.getColumnRange(2).min;
+    let Temp_max = data.getColumnRange(2).max;
+    let Temp_range = Temp_max - Temp_min;
+    options.vAxes[1].viewWindow = { min: Temp_min - Temp_range * 0.1, max: Temp_max + Temp_range * 0.1 };
+
     chart.draw(data,options);
   }
 </script>

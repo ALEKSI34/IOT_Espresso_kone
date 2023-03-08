@@ -4,6 +4,9 @@
 RTOS_PSM *_thePSM;
 
 SemaphoreHandle_t PSMInterruptSemaphore = xSemaphoreCreateBinary();
+TaskHandle_t xInterruptTaskHandle;
+
+#define ONBOARD_LED 2
 
 RTOS_PSM::RTOS_PSM(unsigned char sensePin, unsigned char controlPin, unsigned int range, int mode, unsigned char divider, unsigned char interruptMinTimeDiff)
 {
@@ -14,6 +17,8 @@ RTOS_PSM::RTOS_PSM(unsigned char sensePin, unsigned char controlPin, unsigned in
 
 	pinMode(controlPin, OUTPUT);
 	RTOS_PSM::_controlPin = controlPin;
+
+	pinMode(ONBOARD_LED, OUTPUT);
 	
 	RTOS_PSM::_divider = divider > 0 ? divider : 1;
 
@@ -30,7 +35,7 @@ RTOS_PSM::RTOS_PSM(unsigned char sensePin, unsigned char controlPin, unsigned in
     xTaskCreatePinnedToCore(
         InterruptTask,
         "PSM_Modulation_Task",
-        10000,
+        8096,
         this,
         1,
         &xInterruptTaskHandle,
@@ -72,11 +77,14 @@ void RTOS_PSM::InterruptHandler()
 	}
 }
 
-void RTOS_PSM::set(unsigned int value)
+void RTOS_PSM::set(int value)
 {
 	if (value < RTOS_PSM::_range)
 	{
 		RTOS_PSM::_value = value;
+		if (value == 0)  {
+			digitalWrite(RTOS_PSM::_controlPin, LOW);
+		}
 	}
 	else
 	{
@@ -101,6 +109,7 @@ void RTOS_PSM::stopAfter(long counter)
 
 void RTOS_PSM::calculateSkip()
 {
+
 	RTOS_PSM::_tempvalue += RTOS_PSM::_value;
 
 	if (RTOS_PSM::_tempvalue >= RTOS_PSM::_range)
@@ -119,19 +128,27 @@ void RTOS_PSM::calculateSkip()
 		RTOS_PSM::_skip = false;
 	}
 
+	if (RTOS_PSM::_skip 
+		&& RTOS_PSM::_counter > 0 
+		)
+	{
+		// Pump needs to be on for 1 full wave, so 2 zero cyclings. Make sure _counter(cycles on) is divisible by 2.
+		if (RTOS_PSM::_counter % 2 == 0) {
+			RTOS_PSM::_skip = true;
+		}
+		else {
+			RTOS_PSM::_skip = false;
+		}
+	}
+
 	if (!RTOS_PSM::_skip)
 	{
 		RTOS_PSM::_counter++;
+	} else {
+		RTOS_PSM::_counter = 0;
 	}
 
-	if (!RTOS_PSM::_skip 
-		&& RTOS_PSM::_stopAfter > 0
-		&& RTOS_PSM::_counter > RTOS_PSM::_stopAfter)
-	{
-		RTOS_PSM::_skip = true;
-	}
-
-	updateControl();
+	RTOS_PSM::updateControl();
 }
 
 void RTOS_PSM::updateControl()
@@ -139,10 +156,12 @@ void RTOS_PSM::updateControl()
 	if (RTOS_PSM::_skip)
 	{
 		digitalWrite(RTOS_PSM::_controlPin, LOW);
+		digitalWrite(ONBOARD_LED, LOW);
 	}
 	else
 	{
 		digitalWrite(RTOS_PSM::_controlPin, HIGH);
+		digitalWrite(ONBOARD_LED, HIGH);
 	}
 }
 

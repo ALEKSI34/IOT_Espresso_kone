@@ -12,7 +12,6 @@
 #include <EEPROM.h>
 #include <RTOS_PSM.h>
 #include <PI.h>
-#include <PWM_Relay.h>
 #include "webpage.h"
 #include "wifi_secrets.h"
 
@@ -45,7 +44,7 @@ StaticJsonDocument<200> GeneralDoc;
 
 hw_timer_t * updateTimer = NULL;
 
-TaskHandle_t WebServerTask, OTATaskHandle, StateMachineTask, ControllerTask, KTypeUpdateTask, PressureUpdateTask, BoilerPITask, PressurePITask;
+TaskHandle_t WebServerTask, OTATaskHandle, StateMachineTask, ControllerTask, KTypeUpdateTask, PressureUpdateTask, BoilerPITask, PressurePITask, BoilerPWMTaskHandle;
 
 volatile uint8_t NO_INPUT, DATA_STORED = 0;
 
@@ -124,9 +123,13 @@ t_EspressoItem EspressoIOTArray[] = {
   {0.0, BREWPRESSUREEND}
 };
 uint8_t EspIOTArrLen = 10;
+
+float_t BoilerDutycycle = 0.0;
+
 // Pointers for easier access of these variables.
 float_t *CurPressure = &EspressoIOTArray[PRESSURE].value; // Pointer to Current Pressure value
 float_t *CurTemp = &EspressoIOTArray[TEMP].value; // Pointer to Current Temperature value
+float_t *CurDutyCycleReference = &BoilerDutycycle;
 
 // Stuff stored to EEPROM, initialized to 0.0, updated from old values from eeprom.
 t_EspressoItem BrewParameters[] = {
@@ -143,6 +146,8 @@ const uint8_t ParameterCount = 7;
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
+
+void StoreParametersToEEPROM(uint8_t FirstAddress);
 
 int keyfromstring(const String& var){
   int i = 0;
@@ -414,13 +419,14 @@ void SetupWebServer(void * parameters) {
 
 void HeatingState() {
   // HEATING STATE //
-  digitalWrite(relayPin, LOW);
+  BrewCounter = 0;
   BoilerReference = EspressoIOTArray[BREWTEMPREF].value;
   PressureReference = 0.0;
 }
 
 void SteamingState() {
   // STEAMING STATE //
+  BrewCounter = 0;
   BoilerReference = EspressoIOTArray[STEAMTEMPREF].value;
   PressureReference = 0.0;
 }
@@ -464,8 +470,8 @@ void RunMainStateMachine(void * parameters)  {
   for (;;) {
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
 
-    uint8_t BrewSwitch = digitalRead(brewPin);
-    uint8_t SteamSwitch = digitalRead(steamPin);
+    uint8_t BrewSwitch = !digitalRead(brewPin);
+    uint8_t SteamSwitch = !digitalRead(steamPin);
     uint8_t PreInfusingEnabled = (EspressoIOTArray[PREINFTIME].value > 0.5);
     // Main state machine
 
@@ -490,7 +496,12 @@ void RunMainStateMachine(void * parameters)  {
       }
       break;
     case STEAMING:
-      SteamingState();
+      if (!SteamSwitch) {
+        StateMachineState = HEATING;
+      }
+      else {
+        SteamingState();
+      }
       break;
     case PREINFUSING:
       brewTime += 0.05;
@@ -581,7 +592,6 @@ float_t kThermoread(){
   v >>= 3;
 
   return (float_t) v*0.25;
-  //return float_t(thermocouple.readCelsius()); //thermocouple.readCelsius();
 }
 
 void UpdateKTypeTemp(void * parameters) {
@@ -655,22 +665,41 @@ void BoilerPIController(void * parameters) {
 
   // Define Ranges for unit conversion
   float OutputRange[] = {0.0, 1.0};
-  PI_Controller PIC = PI_Controller(5, 20, OutputRange, 100, piControllerStepSize);
-  PWM_Relay PWM = PWM_Relay(relayPin, 4, piControllerStepSize); // Set Relay PWM frequency to 4Hz - Higher frequencies lead to higher switching losses.
-
-  PWM.EnableOutput();
+  PI_Controller PIC = PI_Controller(0.05, 0.01, OutputRange, 1, piControllerStepSize);
 
   Serial.println("Boiler PI Initialized");
 
   for (;;) {
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
     PIC.reference = BoilerReference+temperatureReferenceOffset; // Add 
-    PIC.Calculate(*CurPressure);
-    PWM.DutyCycle = PIC.output;
-    PWM.Execute();
+    PIC.Calculate(*CurTemp);
+    *CurDutyCycleReference = PIC.output;
     xSemaphoreGive(IOTSemaphore);
     vTaskDelay(piControllerStepSize / portTICK_PERIOD_MS); // Sleep 10 ms
 
+  }
+  vTaskDelete(NULL);
+}
+
+void BoilerPWMTask(void * parameters) {
+
+  uint16_t PWM_RESOLUTION = 100;
+  uint16_t PERIOD_MS = 500; // 2 Hz.
+  uint16_t STEPSIZE_MS = (PERIOD_MS / PWM_RESOLUTION);
+
+  for (;;) {
+
+    xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
+    float_t PWM_DUTY_CYCLE = *CurDutyCycleReference;
+    xSemaphoreGive(IOTSemaphore);
+    int onTime = (int)(PWM_DUTY_CYCLE * PERIOD_MS);
+    int offtime =  PERIOD_MS - onTime;
+
+    digitalWrite(relayPin, HIGH);
+    vTaskDelay(onTime / portTICK_PERIOD_MS);
+
+    digitalWrite(relayPin, LOW);
+    vTaskDelay(offtime / portTICK_PERIOD_MS);
   }
   vTaskDelete(NULL);
 }
@@ -683,7 +712,7 @@ void PressurePIController(void * parameters) {
 
   unsigned int piControllerStepSize = 25;
 
-  PI_Controller PIC = PI_Controller(1, 0.1, OutputRange, 10, piControllerStepSize);
+  PI_Controller PIC = PI_Controller(0.1, 0.05, OutputRange, 100, piControllerStepSize);
 
   Serial.println("Pressure PI Initialized");
 
@@ -691,7 +720,11 @@ void PressurePIController(void * parameters) {
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
     PIC.reference = PressureReference;
     PIC.Calculate(*CurPressure);
-    pump->set(int(PIC.output));
+    if (PressureReference < 1.0) {
+      pump->set(0);
+    } else {
+      pump->set(PIC.output);
+    }
     xSemaphoreGive(IOTSemaphore);
     vTaskDelay( piControllerStepSize / portTICK_PERIOD_MS);
   }
@@ -776,8 +809,8 @@ void setup(){
   
   // Initialize I/O
   pinMode(relayPin, OUTPUT);
-  pinMode(brewPin, INPUT_PULLDOWN); // INPUT_PULLUP
-  pinMode(steamPin, INPUT_PULLDOWN); // INPUT_PULLUP
+  pinMode(brewPin, INPUT_PULLUP);
+  pinMode(steamPin, INPUT_PULLUP);
 
   pinMode(PressurePin, INPUT_PULLDOWN);
 
@@ -863,6 +896,15 @@ void setup(){
     2, // Priority
     &PressurePITask,
     !CONFIG_ARDUINO_RUNNING_CORE // Run the task on the another core, opposed to webserver.
+  );
+  xTaskCreatePinnedToCore(
+    BoilerPWMTask,
+    "Boiler PWM Generation",
+    2048,
+    NULL,
+    1,
+    &BoilerPWMTaskHandle,
+    !CONFIG_ARDUINO_RUNNING_CORE
   );
 }
 

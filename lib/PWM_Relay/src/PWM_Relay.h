@@ -3,6 +3,8 @@
 #ifndef _PWM_H_
 #define _PWM_H_
 
+#define PWM_RESOLUTION 1000
+
 #include "Arduino.h"
 
 class PWM_Relay
@@ -20,7 +22,7 @@ public:
     void DisableOutput();
     void Execute();
 
-    PWM_Relay( unsigned int RelayPin, unsigned int frequency, unsigned int _stepsize);
+    PWM_Relay( unsigned int RelayPin, unsigned int frequency);
     ~PWM_Relay();
 };
 
