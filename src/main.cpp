@@ -14,6 +14,7 @@
 #include <PI.h>
 #include "webpage.h"
 #include "wifi_secrets.h"
+#include <averaging_filter.h>
 
 // IO
 #define relayPin 25 // Pin checked, Connect a port here. Port Component.
@@ -612,8 +613,11 @@ void UpdateKTypeTemp(void * parameters) {
 
 float_t PressureTransducerVoltage() {
   // ESP32 has black zones in 0-0.1V and 3.2V-3.3V.
+  static ExponentialAveragingFilter<2> EAFilter; // Exponential averaging filter.
+
   uint16_t measurement = analogRead(PressurePin);
   float_t espVoltage;
+  measurement = EAFilter(measurement);
   if (measurement <= 0) 
   {
     espVoltage = 0.1;
@@ -644,7 +648,7 @@ void UpdatePressure(void * parameters) {
     float_t Voltage = PressureTransducerVoltage();
     // Update the current pressure. Use average of 2 previous measurements as the voltage value, for some filtering.
     xSemaphoreTake(IOTSemaphore, portMAX_DELAY);
-    *CurPressure = MaxBar*((((Voltage+Prev_Voltage)/2)-Offset)/Range);
+    *CurPressure = MaxBar*((Voltage-Offset)/Range);
     xSemaphoreGive(IOTSemaphore);
     Prev_Voltage = Voltage;
     vTaskDelay(12.5 / portTICK_PERIOD_MS);
@@ -712,7 +716,7 @@ void PressurePIController(void * parameters) {
 
   unsigned int piControllerStepSize = 25;
 
-  PI_Controller PIC = PI_Controller(0.1, 0.05, OutputRange, 100, piControllerStepSize);
+  PI_Controller PIC = PI_Controller(75, 0.01, OutputRange, 100, piControllerStepSize);
 
   Serial.println("Pressure PI Initialized");
 
