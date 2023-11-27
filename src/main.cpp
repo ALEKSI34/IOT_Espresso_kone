@@ -716,7 +716,7 @@ void PressurePIController(void * parameters) {
 
   unsigned int piControllerStepSize = 25;
 
-  PI_Controller PIC = PI_Controller(75, 0.01, OutputRange, 100, piControllerStepSize);
+  PI_Controller PIC = PI_Controller(80, 0.005, OutputRange, 100, piControllerStepSize);
 
   Serial.println("Pressure PI Initialized");
 
